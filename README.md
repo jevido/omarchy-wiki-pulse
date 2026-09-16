@@ -143,8 +143,20 @@ On a quiet day the digest shows an illustration rather than a blank panel.
 `{{dim}}` placeholders, substituted at load, so swapping the art for your own
 is editing one file.
 
+## Looking back
+
+Each run keeps the digest it replaced, so the overlay has a **Previous** button
+(and `p`) that swaps to the last one — typically yesterday's 09:00. The header
+then says which digest you are reading and the button becomes **Back to today**.
+
+It is one button, not a pager: exactly one previous digest is kept on disk, so
+this is somewhere to glance back at, not an archive to walk. Opening the
+overlay always lands on today.
+
 ## Keys
 
-`↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `Esc` or **Got it**
-to dismiss. Clicking outside does *not* dismiss — clearing the morning briefing
-should take a real action.
+`↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `p` for the previous
+digest, `Esc` or **Got it** to dismiss. Clicking outside does *not* dismiss —
+clearing the morning briefing should take a real action.
+
+Scriptable too: `omarchy-shell jevido.wiki previous` opens straight into it.

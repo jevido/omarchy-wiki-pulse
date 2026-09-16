@@ -138,3 +138,22 @@ function degradedNotice(digest, language) {
       return ""
   }
 }
+
+// "woensdag 16 september, 09:00" -- enough to tell two digests apart at a
+// glance without turning the header into a timestamp.
+function digestDate(digest, language) {
+  var raw = digest && digest.generatedAt
+  if (!raw) return ""
+  var d = new Date(raw)
+  if (isNaN(d.getTime())) return ""
+  var nl = language === "nl"
+  var days = nl ? ["zondag","maandag","dinsdag","woensdag","donderdag","vrijdag","zaterdag"]
+               : ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"]
+  var months = nl ? ["januari","februari","maart","april","mei","juni","juli",
+                     "augustus","september","oktober","november","december"]
+                  : ["January","February","March","April","May","June","July",
+                     "August","September","October","November","December"]
+  var hh = ("0" + d.getHours()).slice(-2)
+  var mm = ("0" + d.getMinutes()).slice(-2)
+  return days[d.getDay()] + " " + d.getDate() + " " + months[d.getMonth()] + ", " + hh + ":" + mm
+}

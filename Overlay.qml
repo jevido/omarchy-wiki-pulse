@@ -28,7 +28,17 @@ Item {
   readonly property color accent: Color.accent
   readonly property var borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
 
-  property var digest: Model.EMPTY
+  // Two digests are held at once: today's, and whatever it replaced. The view
+  // is derived rather than swapped in place, so going back and forth cannot
+  // desynchronise the header, the list and the counter.
+  property var current: Model.EMPTY
+  property var previous: null
+  property bool showingPrevious: false
+  readonly property bool hasPrevious: previous !== null
+                                      && ((previous.generatedAt || "") !== "")
+                                      && (previous.generatedAt !== (current.generatedAt || ""))
+  readonly property var digest: (showingPrevious && hasPrevious) ? previous : current
+  readonly property var items: Model.sorted(digest.items)
   property string emptyArt: ""
 
   // The illustration ships as a plain SVG with colour placeholders. Qt's SVG
@@ -47,7 +57,6 @@ Item {
                       .replace(/{{dim}}/g, String(dim))
     return "data:image/svg+xml;base64," + Qt.btoa(svg)
   }
-  property var items: []
   property string language: "nl"
   property bool animate: true
   property int selectedIndex: -1
@@ -60,7 +69,12 @@ Item {
 
   function open(payloadJson) {
     digestFile.reload()
+    previousFile.reload()
+    // Always opens on today's digest; the archive is somewhere you go, not a
+    // state you can get stuck in.
+    root.showingPrevious = false
     root.opened = true
+    root.restage()
     root.selectedIndex = -1
     root.counter = 0
     if (root.animate) counterAnim.restart()
@@ -70,6 +84,7 @@ Item {
 
   function close() {
     root.opened = false
+    root.revealItems = false
   }
 
   // Only the surface on the focused monitor holds the grab, so the focus call
@@ -116,9 +131,38 @@ Item {
   }
 
   function reload(raw) {
+    root.current = Model.parse(raw)
+  }
+
+  function reloadPrevious(raw) {
     var parsed = Model.parse(raw)
-    root.digest = parsed
-    root.items = Model.sorted(parsed.items)
+    root.previous = (parsed.generatedAt || "") !== "" ? parsed : null
+  }
+
+  // Cards animate in on reveal, so a digest swap has to drop and retake the
+  // flag -- otherwise the new delegates are built with it already true and
+  // snap into place without the stagger.
+  property bool revealItems: false
+
+  Timer {
+    id: restager
+    interval: 16
+    onTriggered: root.revealItems = true
+  }
+
+  function restage() {
+    root.revealItems = false
+    restager.restart()
+  }
+
+  function togglePrevious() {
+    if (!root.hasPrevious) return
+    root.showingPrevious = !root.showingPrevious
+    root.selectedIndex = -1
+    root.counter = 0
+    if (root.animate) counterAnim.restart()
+    else root.counter = root.items.length
+    root.restage()
   }
 
   FileView {
@@ -131,6 +175,16 @@ Item {
     // through reload() → onLoaded and always parse fresh content.
     onFileChanged: reload()
     onLoadFailed: root.reload("")
+  }
+
+  FileView {
+    id: previousFile
+    path: root.dataDir + "/digest.prev.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.reloadPrevious(text())
+    onFileChanged: reload()
+    onLoadFailed: root.previous = null
   }
 
   FileView {
@@ -240,6 +294,8 @@ Item {
               root.move(1)
             } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
               root.move(-1)
+            } else if (event.key === Qt.Key_P) {
+              root.togglePrevious()
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               root.openItem(root.selectedIndex < 0 ? 0 : root.selectedIndex)
             } else {
@@ -290,6 +346,16 @@ Item {
                     font.family: Style.font.menuFamily
                     font.pixelSize: Style.font.heading
                     font.bold: true
+                  }
+
+                  Text {
+                    visible: root.showingPrevious
+                    text: (root.language === "nl" ? "vorige overzicht · " : "previous digest · ")
+                          + Model.digestDate(root.digest, root.language)
+                    color: root.accent
+                    opacity: 0.9
+                    font.family: Style.font.menuFamily
+                    font.pixelSize: Style.font.caption
                   }
 
                   Text {
@@ -429,7 +495,7 @@ Item {
                   language: root.language
                   selected: root.selectedIndex === index
                   animate: root.animate
-                  revealed: root.opened
+                  revealed: root.revealItems
                   onActivated: root.openItem(index)
                   onHovered: root.selectedIndex = index
                 }
@@ -467,11 +533,25 @@ Item {
 
           Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: root.language === "nl" ? "↑↓ kiezen · ⏎ openen" : "↑↓ select · ⏎ open"
+            text: {
+              var nl = root.language === "nl"
+              var base = nl ? "↑↓ kiezen · ⏎ openen" : "↑↓ select · ⏎ open"
+              return root.hasPrevious ? base + (nl ? " · p vorige" : " · p previous") : base
+            }
             color: root.foreground
             opacity: 0.45
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.caption
+          }
+
+          // One button, not a pager: there is exactly one previous digest on
+          // disk, so this is somewhere to look back at, not a history to walk.
+          Button {
+            visible: root.hasPrevious
+            text: root.showingPrevious
+                  ? (root.language === "nl" ? "Terug naar vandaag" : "Back to today")
+                  : (root.language === "nl" ? "Vorige" : "Previous")
+            onClicked: root.togglePrevious()
           }
 
           Button {
@@ -490,6 +570,9 @@ Item {
     function show(): void { root.open("{}") }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): void { digestFile.reload() }
+    function refresh(): void { digestFile.reload(); previousFile.reload() }
+    // Lets a keybinding drop straight into the archive, and makes the toggle
+    // testable without synthesising a keypress.
+    function previous(): void { root.togglePrevious() }
   }
 }
