@@ -112,13 +112,28 @@ exact model input, for when a summary looks wrong).
 ```
 ~/.config/omarchy/wiki-digest.json              config (yours, never overwritten)
 ~/.local/share/omarchy-wiki-digest/digest.json  what the overlay renders
+~/.local/share/omarchy-wiki-digest/pulse.json   changes since that digest was built
 ~/.local/state/omarchy-wiki-digest/             watermark, baselines, daily stamp, log
 ```
+
+## Between digests
+
+The digest is built once. What lands after it is picked up by `pulse`, which
+counts the changes *and* records them, so the badge and the overlay always
+describe the same thing — a count the dialog cannot show would just read as a
+broken app. Those rows appear under a "Since this morning" divider, without
+summaries: summarising is the morning run's job, and pulse never calls the
+model. Dismissing the overlay clears them from the badge; a page edited again
+afterwards comes back.
+
+Pulse is deliberately a reader — it touches neither the watermark, the
+baselines nor the daily stamp, so it can never swallow a change the morning
+digest still owes you.
 
 ## The widget
 
 The bar icon is always there, so today's digest is always one click away — left
-click reopens it, right click refreshes the count. When something is new the
+click reopens it, right click refreshes the count, middle click runs a pulse. When something is new the
 icon carries a count and brightens; when the wiki cannot be reached it dims,
 because a confident count we cannot back up is worse than no count.
 

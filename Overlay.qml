@@ -39,6 +39,19 @@ Item {
                                       && (previous.generatedAt !== (current.generatedAt || ""))
   readonly property var digest: (showingPrevious && hasPrevious) ? previous : current
   readonly property var items: Model.sorted(digest.items)
+
+  // Whatever the badge counted after this digest was built. Held apart from
+  // `items` because it is a different kind of row -- fetched, not summarised --
+  // and because the archive must never mix today's live pulse into a digest
+  // from another day.
+  property var pulse: Model.EMPTY_PULSE
+  property var pulseSeen: []
+  readonly property var fresh: root.showingPrevious
+                               ? []
+                               : Model.unseenPulse(root.pulse, root.pulseSeen)
+  // One list for everything the reader can select, open or count, so the
+  // keyboard and the numeral cannot disagree with what is on screen.
+  readonly property var rows: root.items.concat(root.fresh)
   property string emptyArt: ""
 
   // The illustration ships as a plain SVG with colour placeholders. Qt's SVG
@@ -70,6 +83,8 @@ Item {
   function open(payloadJson) {
     digestFile.reload()
     previousFile.reload()
+    pulseFile.reload()
+    readFile.reload()
     // Always opens on today's digest; the archive is somewhere you go, not a
     // state you can get stuck in.
     root.showingPrevious = false
@@ -78,7 +93,7 @@ Item {
     root.selectedIndex = -1
     root.counter = 0
     if (root.animate) counterAnim.restart()
-    else root.counter = root.items.length
+    else root.counter = root.rows.length
     Qt.callLater(root.grabKeyboard)
   }
 
@@ -114,18 +129,18 @@ Item {
   }
 
   function openItem(index) {
-    if (index < 0 || index >= root.items.length) return
-    var url = root.items[index].url
+    if (index < 0 || index >= root.rows.length) return
+    var url = root.rows[index].url
     if (!url) return
     Quickshell.execDetached(["xdg-open", url])
     root.dismiss()
   }
 
   function move(delta) {
-    if (root.items.length === 0) return
+    if (root.rows.length === 0) return
     var next = root.selectedIndex + delta
     if (next < 0) next = 0
-    if (next >= root.items.length) next = root.items.length - 1
+    if (next >= root.rows.length) next = root.rows.length - 1
     root.selectedIndex = next
     scroller.ensureVisible(next)
   }
@@ -161,7 +176,7 @@ Item {
     root.selectedIndex = -1
     root.counter = 0
     if (root.animate) counterAnim.restart()
-    else root.counter = root.items.length
+    else root.counter = root.rows.length
     root.restage()
   }
 
@@ -185,6 +200,28 @@ Item {
     onLoaded: root.reloadPrevious(text())
     onFileChanged: reload()
     onLoadFailed: root.previous = null
+  }
+
+  FileView {
+    id: pulseFile
+    path: root.dataDir + "/pulse.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.pulse = Model.parsePulse(text())
+    onFileChanged: reload()
+    onLoadFailed: root.pulse = Model.EMPTY_PULSE
+  }
+
+  // Read for `pulseSeen` only; the digest's own read state belongs to the bar
+  // widget, which is the surface that has to show a count.
+  FileView {
+    id: readFile
+    path: root.home + "/.local/state/omarchy-wiki-digest/read.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.pulseSeen = Model.parsePulseSeen(text())
+    onFileChanged: reload()
+    onLoadFailed: root.pulseSeen = []
   }
 
   FileView {
@@ -214,7 +251,7 @@ Item {
     target: root
     property: "counter"
     from: 0
-    to: root.items.length
+    to: root.rows.length
     duration: 620
     easing.type: Easing.OutCubic
   }
@@ -258,7 +295,7 @@ Item {
         width: panel.cardWidth
         // On a quiet day the card is two lines of text; framing that with a
         // screen of empty panel would read as a broken layout, not as calm.
-        height: root.items.length === 0
+        height: root.rows.length === 0
                 ? content.implicitHeight + card.contentTopInset + card.contentBottomInset
                   + footer.height + Style.space(14)
                 : panel.cardHeight
@@ -329,7 +366,7 @@ Item {
 
                 Text {
                   text: Math.round(root.counter)
-                  visible: root.items.length > 0
+                  visible: root.rows.length > 0
                   color: root.accent
                   font.family: Style.font.menuFamily
                   font.pixelSize: Style.font.displayLarge
@@ -341,7 +378,7 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
 
                   Text {
-                    text: Model.headlineFor(root.digest, root.language)
+                    text: Model.headlineFor(root.digest, root.language, root.fresh.length)
                     color: root.foreground
                     font.family: Style.font.menuFamily
                     font.pixelSize: Style.font.heading
@@ -413,8 +450,8 @@ Item {
           // feel like an outcome rather than a failure to load.
           Item {
             width: parent.width
-            height: root.items.length === 0 ? Style.space(190) : 0
-            visible: root.items.length === 0
+            height: root.rows.length === 0 ? Style.space(190) : 0
+            visible: root.rows.length === 0
 
             Column {
               anchors.centerIn: parent
@@ -460,7 +497,7 @@ Item {
             width: parent.width
             // Nothing tall on an empty day: the card shrinks to its text
             // instead of framing a screen of void.
-            height: root.items.length === 0
+            height: root.rows.length === 0
                     ? 0
                     : Math.max(0, parent.height - y - footer.height - Style.space(10))
             contentHeight: itemColumn.implicitHeight
@@ -481,23 +518,69 @@ Item {
               width: scroller.width
               spacing: Style.space(8)
 
+              // One repeater over the combined list rather than two, so an
+              // index means the same thing to the keyboard, the scroller and
+              // the delegate. The divider rides on the first pulse row.
               Repeater {
                 id: itemRepeater
-                model: root.items
+                model: root.rows
 
-                DigestCard {
+                Column {
+                  id: row
                   required property int index
                   required property var modelData
 
+                  readonly property bool startsFresh: root.fresh.length > 0
+                                                      && index === root.items.length
+
                   width: itemColumn.width
-                  entry: modelData
-                  position: index
-                  language: root.language
-                  selected: root.selectedIndex === index
-                  animate: root.animate
-                  revealed: root.revealItems
-                  onActivated: root.openItem(index)
-                  onHovered: root.selectedIndex = index
+                  spacing: Style.space(8)
+
+                  // Says where the summarised digest stops and the raw tail
+                  // begins, so a row without a summary reads as a boundary
+                  // rather than as a half-loaded card.
+                  Item {
+                    width: parent.width
+                    height: row.startsFresh ? divider.implicitHeight + Style.space(12) : 0
+                    visible: row.startsFresh
+
+                    Row {
+                      id: divider
+                      anchors.bottom: parent.bottom
+                      spacing: Style.space(8)
+
+                      Text {
+                        text: Model.freshHeading(root.language)
+                        color: root.foreground
+                        opacity: 0.55
+                        font.family: Style.font.menuFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        text: "· " + Model.freshNote(root.language)
+                        color: root.foreground
+                        opacity: 0.35
+                        font.family: Style.font.menuFamily
+                        font.pixelSize: Style.font.caption
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+                  }
+
+                  DigestCard {
+                    width: parent.width
+                    entry: row.modelData
+                    position: row.index
+                    language: root.language
+                    selected: root.selectedIndex === row.index
+                    animate: root.animate
+                    revealed: root.revealItems
+                    onActivated: root.openItem(row.index)
+                    onHovered: root.selectedIndex = row.index
+                  }
                 }
               }
             }
@@ -570,7 +653,7 @@ Item {
     function show(): void { root.open("{}") }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): void { digestFile.reload(); previousFile.reload() }
+    function refresh(): void { digestFile.reload(); previousFile.reload(); pulseFile.reload(); readFile.reload() }
     // Lets a keybinding drop straight into the archive, and makes the toggle
     // testable without synthesising a keypress.
     function previous(): void { root.togglePrevious() }

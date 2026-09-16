@@ -23,8 +23,9 @@ BarWidget {
   readonly property bool hideWhenEmpty: setting("hideWhenEmpty", false)
 
   property var digest: Model.EMPTY
-  property var pulse: ({ newSinceDigest: 0, health: "ok" })
+  property var pulse: Model.EMPTY_PULSE
   property var readIds: []
+  property var pulseSeen: []
   property string readAt: ""
 
   // Unread means two different things that add up to one number: a digest the
@@ -34,7 +35,9 @@ BarWidget {
     if (readAt && readAt >= digest.generatedAt) return 0
     return (digest.items || []).length
   }
-  readonly property int sinceDigest: pulse.newSinceDigest || 0
+  // Counts only the rows the reader has not cleared, so dismissing the overlay
+  // — which shows those same rows — actually empties the badge.
+  readonly property int sinceDigest: Model.unseenPulseCount(pulse, pulseSeen)
   readonly property int count: unreadDigest + sinceDigest
   readonly property bool stale: pulse.health === "stale"
 
@@ -69,15 +72,9 @@ BarWidget {
     path: root.dataDir + "/pulse.json"
     watchChanges: true
     printErrors: false
-    onLoaded: {
-      try {
-        root.pulse = JSON.parse(text())
-      } catch (e) {
-        root.pulse = { newSinceDigest: 0, health: "stale" }
-      }
-    }
+    onLoaded: root.pulse = Model.parsePulse(text())
     onFileChanged: reload()
-    onLoadFailed: root.pulse = { newSinceDigest: 0, health: "ok" }
+    onLoadFailed: root.pulse = Model.EMPTY_PULSE
   }
 
   FileView {
@@ -86,6 +83,7 @@ BarWidget {
     watchChanges: true
     printErrors: false
     onLoaded: {
+      root.pulseSeen = Model.parsePulseSeen(text())
       try {
         root.readAt = JSON.parse(text()).readAt || ""
       } catch (e) {
@@ -93,7 +91,10 @@ BarWidget {
       }
     }
     onFileChanged: reload()
-    onLoadFailed: root.readAt = ""
+    onLoadFailed: {
+      root.readAt = ""
+      root.pulseSeen = []
+    }
   }
 
   WidgetButton {

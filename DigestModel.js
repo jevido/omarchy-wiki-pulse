@@ -37,6 +37,68 @@ function parseIds(raw) {
   }
 }
 
+var EMPTY_PULSE = { newSinceDigest: 0, health: "ok", items: [] }
+
+// Same contract as parse(): an unreadable pulse file is "nothing new", never a
+// broken widget. `items` may be absent on a file written by an older build, so
+// callers fall back to the bare count.
+function parsePulse(raw) {
+  if (!raw) return EMPTY_PULSE
+  try {
+    var parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object") return EMPTY_PULSE
+    return {
+      newSinceDigest: parsed.newSinceDigest || 0,
+      health: parsed.health || "ok",
+      items: Array.isArray(parsed.items) ? parsed.items : null
+    }
+  } catch (e) {
+    return EMPTY_PULSE
+  }
+}
+
+function parsePulseSeen(raw) {
+  try {
+    var parsed = JSON.parse(raw)
+    return Array.isArray(parsed.pulseSeen) ? parsed.pulseSeen : []
+  } catch (e) {
+    return []
+  }
+}
+
+// Must match pulse_key() in the pipeline: id plus timestamp, so a page edited
+// again after you cleared it counts as new rather than staying dismissed.
+function pulseKey(item) {
+  return (item.id || "") + "@" + (item.updatedAt || "")
+}
+
+// What the reader has not cleared yet. A pulse file without items (older
+// build, or one written before this feature) has nothing to filter, so the
+// caller keeps using its count.
+function unseenPulse(pulse, seen) {
+  if (!pulse || !pulse.items) return []
+  var keys = seen || []
+  return pulse.items.filter(function (item) {
+    return keys.indexOf(pulseKey(item)) === -1
+  })
+}
+
+function unseenPulseCount(pulse, seen) {
+  if (!pulse) return 0
+  if (!pulse.items) return pulse.newSinceDigest || 0
+  return unseenPulse(pulse, seen).length
+}
+
+function freshHeading(language) {
+  return language === "nl" ? "Sinds vanochtend" : "Since this morning"
+}
+
+// Says why these rows read differently from the ones above them, so a missing
+// summary looks like a deliberate boundary rather than a failed LLM call.
+function freshNote(language) {
+  return language === "nl" ? "nog niet samengevat" : "not summarised yet"
+}
+
 var PRIORITY_ORDER = { high: 0, medium: 1, low: 2 }
 
 function sorted(items) {
@@ -95,11 +157,15 @@ function relativeTime(iso, language) {
 
 // The count is rendered as its own large numeral, so the headline must not
 // repeat it -- "7  7 wijzigingen" reads as a bug.
-function headlineFor(digest, language) {
+function headlineFor(digest, language, extra) {
   var nl = language === "nl"
-  if (digest.status === "empty") return nl ? "Rustig op de wiki" : "Quiet on the wiki"
-  if (digest.status === "nodigest") return nl ? "Nog geen overzicht" : "No digest yet"
-  var n = (digest.items || []).length
+  var n = (digest.items || []).length + (extra || 0)
+  // The status words describe a day with nothing on it; anything the pulse
+  // picked up after the digest was built makes that untrue.
+  if (n === 0) {
+    if (digest.status === "empty") return nl ? "Rustig op de wiki" : "Quiet on the wiki"
+    if (digest.status === "nodigest") return nl ? "Nog geen overzicht" : "No digest yet"
+  }
   if (nl) return n === 1 ? "wijziging" : "wijzigingen"
   return n === 1 ? "change" : "changes"
 }

@@ -48,6 +48,11 @@ PULSE_PATH = DATA_DIR / "pulse.json"
 
 SCHEMA_VERSION = 1
 
+# The badge may promise only as much as the overlay can show, so pulse carries
+# its own items. Capped: this is the "something landed" list, not a second
+# digest, and an unbounded one would turn a quiet surface into a feed.
+PULSE_MAX_ITEMS = 20
+
 DEFAULTS = {
     "baseUrl": "",
     "tokenCommand": "",
@@ -588,6 +593,20 @@ def doc_url(cfg, doc) -> str:
     return f"{cfg['baseUrl']}/doc/{doc.get('urlId', '')}"
 
 
+def excerpt(text: str, limit: int = 140) -> str:
+    """First line or so of a page, with the markup taken off.
+
+    These excerpts stand in for a summary on the rows no model has read, so
+    leaving `**bold**` and `# headings` in them would put syntax on screen
+    where a sentence belongs.
+    """
+    body = re.sub(r"^\s*#{1,6}\s*", "", text or "", flags=re.MULTILINE)
+    body = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", body)  # links, images
+    body = re.sub(r"(\*\*|__|\*|_|`|~~)", "", body)            # emphasis, code
+    body = re.sub(r"\s+", " ", body).strip()
+    return body[:limit]
+
+
 def base_item(cfg, item, collections) -> dict:
     doc = item["doc"]
     return {
@@ -654,7 +673,7 @@ def mechanical_items(cfg, refmap, collections) -> list[dict]:
             {
                 "rank": position,
                 "priority": "low",
-                "summary": (item["doc"].get("text") or "")[:140].replace("\n", " "),
+                "summary": excerpt(item["doc"].get("text") or ""),
                 "whyItMattersToMe": "",
                 "suggestedAction": "fyi",
                 "tags": [],
@@ -967,11 +986,16 @@ def parse_duration(text: str) -> timedelta:
 
 
 def cmd_pulse(_args) -> int:
-    """Count changes since the last digest. No LLM, no state mutation.
+    """List the changes since the last digest. No LLM, no state mutation.
 
     Deliberately touches neither the watermark, the baselines nor the stamp —
     the badge must never be able to consume a change the morning digest still
     owes the user.
+
+    It writes the rows it counted, not just the count: a badge that says "1"
+    over an overlay that can only read `digest.json` is a promise the dialog
+    cannot keep. These rows carry no summary — that is the morning digest's
+    job — only enough to name the page and open it.
     """
     cfg = load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -988,18 +1012,40 @@ def cmd_pulse(_args) -> int:
                 "newSinceDigest": 0,
                 "health": "nodigest",
                 "digestAge": None,
+                "items": [],
             },
             0o644,
         )
         return 0
     anchor = parse_iso(anchor_raw)
 
-    health, count = "ok", 0
+    health, count, entries = "ok", 0, []
     try:
         token = get_token(cfg)
         me = state.get("me") or {}
         docs = fetch_changed(cfg, token, anchor, max_pages=3)
-        count = len(classify(docs, state, me, cfg))
+        found = classify(docs, state, me, cfg)
+        count = len(found)
+        # Cached names only — resolving collections would write to state, and
+        # pulse stays a reader. An unknown collection renders as the same dash
+        # the digest uses.
+        collections = state.get("collections") or {}
+        ordered = sorted(
+            found, key=lambda i: i["doc"].get("updatedAt") or "", reverse=True
+        )
+        for position, item in enumerate(ordered[:PULSE_MAX_ITEMS], start=1):
+            entry = base_item(cfg, item, collections)
+            entry.update(
+                {
+                    "rank": position,
+                    "priority": "low",
+                    "summary": excerpt(item["doc"].get("text") or ""),
+                    "whyItMattersToMe": "",
+                    "suggestedAction": "fyi",
+                    "tags": [],
+                }
+            )
+            entries.append(entry)
     except (ApiError, SystemExit) as exc:
         health = "stale"
         log(f"pulse: {exc}")
@@ -1013,10 +1059,21 @@ def cmd_pulse(_args) -> int:
             "newSinceDigest": count,
             "health": health,
             "digestAge": f"PT{int(age.total_seconds() // 3600)}H{int(age.total_seconds() % 3600 // 60)}M",
+            "items": entries,
         },
         0o644,
     )
     return 0
+
+
+def pulse_key(item) -> str:
+    """Identify one revision of one page.
+
+    Keyed on the timestamp as well as the id, so re-reading a page that was
+    edited again after you cleared it counts as new — which is the whole
+    reason the badge exists.
+    """
+    return f"{item.get('id', '')}@{item.get('updatedAt', '')}"
 
 
 def cmd_mark_read(_args) -> int:
@@ -1024,9 +1081,14 @@ def cmd_mark_read(_args) -> int:
 
     The overlay calls this on dismiss rather than writing the file itself, so
     there stays exactly one writer per file in the state directory.
+
+    The pulse rows are cleared here too: the overlay shows them alongside the
+    digest, so dismissing it has seen them, and a badge that kept counting
+    what is already on screen would never reach zero.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     digest = load_json(DIGEST_PATH, {})
+    pulse = load_json(PULSE_PATH, {})
     write_json_atomic(
         READ_PATH,
         {
@@ -1034,6 +1096,7 @@ def cmd_mark_read(_args) -> int:
             "readAt": datetime.now().astimezone().isoformat(timespec="seconds"),
             "digestGeneratedAt": digest.get("generatedAt", ""),
             "ids": [item.get("id") for item in (digest.get("items") or [])],
+            "pulseSeen": [pulse_key(item) for item in (pulse.get("items") or [])],
         },
         0o644,
     )
