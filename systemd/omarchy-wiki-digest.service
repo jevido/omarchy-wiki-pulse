@@ -10,6 +10,10 @@ Environment=PATH=/usr/bin:/usr/local/bin:%h/.local/bin
 # launched with -- qs matches instances by config path string, so the
 # ~/.local/share/omarchy symlink to the same directory does NOT match.
 Environment=OMARCHY_PATH=/usr/share/omarchy
+# Headless Claude auth. `-` so a missing file is not a startup failure: the
+# script degrades to a title-only digest rather than producing nothing.
+# Must be the plain `KEY=value` form -- systemd's parser has no `export`.
+EnvironmentFile=-%h/.config/claude-oauth-token.env
 ExecStart=%h/.local/bin/omarchy-wiki-digest run
 # The LLM call is capped at 300s; this leaves room for fetch retries on a slow
 # network without ever hanging the boot path.
