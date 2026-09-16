@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 150" fill="none">
+  <!-- Colours are placeholders. Overlay.qml substitutes theme tokens at load
+       time and hands the result to Image as a base64 data URI, so this
+       illustration follows `omarchy theme set` like everything else. -->
+  <path d="M34 126 H166" stroke="{{dim}}" stroke-width="2.5" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- a closed book: the reading is done -->
+  <path d="M58 56 h68 a12 12 0 0 1 12 12 v42 a12 12 0 0 1 -12 12 h-68 a9 9 0 0 1 -9 -9 v-48 a9 9 0 0 1 9 -9 z"
+        stroke="{{fg}}" stroke-width="3.5" stroke-linejoin="round"/>
+  <path d="M58 56 v66" stroke="{{fg}}" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M74 78 h44" stroke="{{dim}}" stroke-width="3" stroke-linecap="round"/>
+  <path d="M74 92 h30" stroke="{{dim}}" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- bookmark, tucked in at the end -->
+  <path d="M116 56 v30 l-8 -7 -8 7 v-30 z" fill="{{accent}}" opacity="0.9"/>
+
+  <!-- all caught up -->
+  <circle cx="148" cy="50" r="19" fill="{{accent}}"/>
+  <path d="M139.5 50.5 l6 6 l11.5 -13" stroke="{{bg}}" stroke-width="4"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- a little cheer -->
+  <path d="M36 42 Q37.4 48.6 44 50 Q37.4 51.4 36 58 Q34.6 51.4 28 50 Q34.6 48.6 36 42 z" fill="{{accent}}"/>
+  <path d="M172 94 Q173 98.6 177.5 99.5 Q173 100.4 172 105 Q171 100.4 166.5 99.5 Q171 98.6 172 94 z" fill="{{accent}}" opacity="0.8"/>
+  <path d="M45 99 Q45.8 102.4 49 103 Q45.8 103.6 45 107 Q44.2 103.6 41 103 Q44.2 102.4 45 99 z" fill="{{accent}}" opacity="0.55"/>
+</svg>

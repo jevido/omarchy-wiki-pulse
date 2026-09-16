@@ -29,6 +29,24 @@ Item {
   readonly property var borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
 
   property var digest: Model.EMPTY
+  property string emptyArt: ""
+
+  // The illustration ships as a plain SVG with colour placeholders. Qt's SVG
+  // renderer has no notion of `currentColor`, so the tokens are substituted
+  // here and the result handed to Image as a data URI — which keeps the art
+  // editable as a file *and* theme-aware.
+  readonly property string emptyArtUri: {
+    if (!emptyArt) return ""
+    var fg = root.foreground, bg = root.background
+    var dim = Qt.rgba(bg.r + (fg.r - bg.r) * 0.45,
+                      bg.g + (fg.g - bg.g) * 0.45,
+                      bg.b + (fg.b - bg.b) * 0.45, 1)
+    var svg = emptyArt.replace(/{{accent}}/g, String(root.accent))
+                      .replace(/{{fg}}/g, String(fg))
+                      .replace(/{{bg}}/g, String(bg))
+                      .replace(/{{dim}}/g, String(dim))
+    return "data:image/svg+xml;base64," + Qt.btoa(svg)
+  }
   property var items: []
   property string language: "nl"
   property bool animate: true
@@ -113,6 +131,13 @@ Item {
     // through reload() → onLoaded and always parse fresh content.
     onFileChanged: reload()
     onLoadFailed: root.reload("")
+  }
+
+  FileView {
+    id: emptyArtFile
+    path: String(Qt.resolvedUrl("empty.svg")).replace("file://", "")
+    printErrors: false
+    onLoaded: root.emptyArt = text()
   }
 
   FileView {
@@ -269,7 +294,7 @@ Item {
 
                   Text {
                     text: Model.subtitleFor(root.digest, root.language)
-                    visible: text !== ""
+                    visible: text !== "" && root.items.length > 0
                     color: root.foreground
                     opacity: 0.6
                     font.family: Style.font.menuFamily
@@ -296,7 +321,7 @@ Item {
           Text {
             width: parent.width
             visible: text !== ""
-            text: root.digest.tldr || ""
+            text: root.items.length > 0 ? (root.digest.tldr || "") : ""
             color: root.foreground
             opacity: root.opened ? 0.92 : 0
             wrapMode: Text.WordWrap
@@ -315,6 +340,52 @@ Item {
             wrapMode: Text.WordWrap
             font.family: Style.font.menuFamily
             font.pixelSize: Style.font.caption
+          }
+
+          // A quiet day deserves a picture, not a blank panel: it says "you are
+          // caught up" faster than the sentence does, and makes the empty state
+          // feel like an outcome rather than a failure to load.
+          Item {
+            width: parent.width
+            height: root.items.length === 0 ? Style.space(190) : 0
+            visible: root.items.length === 0
+
+            Column {
+              anchors.centerIn: parent
+              spacing: Style.space(14)
+
+              Image {
+                id: art
+                source: root.emptyArtUri
+                visible: source !== ""
+                width: Style.space(200)
+                height: Style.space(150)
+                sourceSize.width: width * 2
+                sourceSize.height: height * 2
+                fillMode: Image.PreserveAspectFit
+                smooth: true
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                // Breathes rather than sits. Slow enough to register as calm.
+                transform: Translate { id: bob; y: 0 }
+                SequentialAnimation {
+                  running: root.opened && root.animate && art.visible
+                  loops: Animation.Infinite
+                  NumberAnimation { target: bob; property: "y"; to: -6; duration: 1900; easing.type: Easing.InOutSine }
+                  NumberAnimation { target: bob; property: "y"; to: 0;  duration: 1900; easing.type: Easing.InOutSine }
+                }
+              }
+
+              Text {
+                text: root.language === "nl" ? "Je bent bij." : "You're all caught up."
+                color: root.foreground
+                opacity: 0.75
+                font.family: Style.font.menuFamily
+                font.pixelSize: Style.font.title
+                horizontalAlignment: Text.AlignHCenter
+                anchors.horizontalCenter: parent.horizontalCenter
+              }
+            }
           }
 
           // ---- items --------------------------------------------------------

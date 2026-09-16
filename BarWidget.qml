@@ -109,13 +109,17 @@ BarWidget {
     // worse than no count).
     opacity: root.stale ? 0.4 : (root.count > 0 ? 1.0 : 0.62)
     Behavior on opacity { NumberAnimation { duration: 180 } }
+    // The shortcut lives in the tooltip because that is where someone looks
+    // when they wonder what this icon does.
+    readonly property string shortcutHint: root.setting("shortcut", "Super+D")
     tooltipText: {
-      if (root.stale) return qsTr("Wiki unreachable — count may be out of date")
-      if (root.count === 0) return qsTr("Nothing new on the wiki")
+      var suffix = shortcutHint ? "  (" + shortcutHint + ")" : ""
+      if (root.stale) return qsTr("Wiki unreachable — count may be out of date") + suffix
+      if (root.count === 0) return qsTr("Nothing new on the wiki") + suffix
       var parts = []
       if (root.unreadDigest > 0) parts.push(root.unreadDigest + qsTr(" in today's digest"))
       if (root.sinceDigest > 0) parts.push(root.sinceDigest + qsTr(" since this morning"))
-      return parts.join(", ")
+      return parts.join(", ") + suffix
     }
 
     onPressed: function (b) {

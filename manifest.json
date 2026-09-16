@@ -22,7 +22,8 @@
     "defaultSection": "right",
     "defaults": {
       "glyph": "󰂺",
-      "hideWhenEmpty": false
+      "hideWhenEmpty": false,
+      "shortcut": "Super+D"
     },
     "schema": [
       {
@@ -34,6 +35,11 @@
         "key": "hideWhenEmpty",
         "type": "boolean",
         "label": "Hide the widget when there is nothing new"
+      },
+      {
+        "key": "shortcut",
+        "type": "string",
+        "label": "Shortcut shown in the tooltip"
       }
     ]
   }
