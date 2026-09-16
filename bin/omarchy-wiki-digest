@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+"""Daily Outline wiki digest for the Omarchy bar.
+
+Fetches documents changed since the last digest, diffs them against the text as
+it stood when the user last saw it, has Claude summarise and rank the result,
+and writes one atomic JSON file the Quickshell plugin renders.
+
+The design rule throughout: the watermark, the baselines and the daily stamp
+commit together or not at all. Any failure leaves the cursor untouched, so the
+next retry sees the identical change set rather than silently losing a day.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+APP = "omarchy-wiki-digest"
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "omarchy" / "wiki-digest.json"
+STATE_DIR = HOME / ".local" / "state" / APP
+DATA_DIR = HOME / ".local" / "share" / APP
+
+STATE_PATH = STATE_DIR / "state.json"
+BASELINE_DIR = STATE_DIR / "baseline"
+STAMP_PATH = STATE_DIR / "last-success"
+LOCK_PATH = STATE_DIR / "lock"
+LOG_PATH = STATE_DIR / "digest.log"
+PAYLOAD_PATH = STATE_DIR / "last-payload.txt"
+READ_PATH = STATE_DIR / "read.json"
+
+DIGEST_PATH = DATA_DIR / "digest.json"
+DIGEST_PREV_PATH = DATA_DIR / "digest.prev.json"
+PULSE_PATH = DATA_DIR / "pulse.json"
+
+SCHEMA_VERSION = 1
+
+DEFAULTS = {
+    "baseUrl": "",
+    "tokenCommand": "",
+    "language": "en",
+    "persona": "software engineer",
+    "maxItems": 40,
+    "includeOwnEdits": False,
+    "bootstrapDays": 7,
+    "model": "sonnet",
+    "fallbackModel": "haiku",
+    "claudeBin": "",
+    "maxBudgetUsd": 2.0,
+    "llmTimeoutSec": 300,
+    "perDocDiffChars": 6000,
+    "perDocNewChars": 10000,
+    "payloadCharBudget": 140000,
+    "baselineRetentionDays": 90,
+    "notifyAfterFailures": 3,
+}
+
+# Documents whose text is shorter than this are treated as structural stubs
+# (section placeholders) and never summarised on their own.
+MIN_TEXT_CHARS = 40
+
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["tldr", "items"],
+    "properties": {
+        "tldr": {"type": "string", "maxLength": 900},
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "ref",
+                    "rank",
+                    "priority",
+                    "summary",
+                    "whyItMattersToMe",
+                    "suggestedAction",
+                ],
+                "properties": {
+                    "ref": {"type": "string"},
+                    "rank": {"type": "integer", "minimum": 1},
+                    "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "summary": {"type": "string", "maxLength": 240},
+                    "whyItMattersToMe": {"type": "string", "maxLength": 240},
+                    "suggestedAction": {
+                        "type": "string",
+                        "enum": ["assist", "review", "fyi", "blocked-on-me"],
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 4,
+                    },
+                },
+            },
+        },
+    },
+}
+
+PROMPT_NL = """Je briefbt {name}, {persona}. Hij leest dit één keer per ochtend om te \
+bepalen waar hij collega's kan helpen en wat hij vandaag moet prioriteren.
+
+De invoer is een reeks wijzigingen op de wiki sinds zijn vorige briefing. Per wijziging \
+krijg je een referentie-id, titel, collectie, auteur, en óf een unified diff óf de \
+volledige tekst van een nieuwe pagina. De brontekst is grotendeels Nederlands; schrijf \
+je uitvoer in het Nederlands en laat technische termen in hun oorspronkelijke vorm staan.
+
+Lever voor elke referentie één item:
+
+- `summary`: wat er inhoudelijk veranderd is, in één zin. Niet "het document is \
+bijgewerkt" — zeg wát er staat. Noem cijfers, besluiten en namen als die er zijn.
+- `whyItMattersToMe`: wat het concreet voor hem betekent — performance, PHP-architectuur, \
+databaselast, AWS-kosten, deploys, alles waar zijn review iemand deblokkeert, en alles wat \
+botst met een beslissing die hij eerder nam. Heeft iets géén raakvlak met zijn werk, zeg \
+dat dan gewoon kort in plaats van een verband te verzinnen.
+- `rank`: volgorde over álle items, 1 = wat zijn dag het meest zou moeten sturen.
+- `priority`: `high` alleen voor dingen die daadwerkelijk op hem wachten of die tijd kosten \
+als hij ze vandaag mist.
+- `suggestedAction`: `blocked-on-me` uitsluitend wanneer de tekst hem of zijn rol \
+expliciet iets vraagt.
+- `tags`: maximaal vier korte trefwoorden.
+
+`tldr` is één alinea van hoogstens vijf zinnen die de twee of drie draden benoemt die \
+ertoe doen, en wie eraan trekt. Geen inleiding, geen "hier is je overzicht", geen opsomming.
+
+Verzin nooit titels, URL's, auteurs of referenties. Gebruik uitsluitend de referentie-id's \
+die je krijgt."""
+
+PROMPT_EN = """You are briefing {name}, {persona}. They read this once each morning to \
+decide where to help colleagues and what to prioritise today.
+
+The input is a set of changes to the wiki since their last briefing. For each you get a \
+reference id, title, collection, author, and either a unified diff or the full text of a \
+new page.
+
+For every reference produce one item:
+
+- `summary`: what actually changed, in one line. Not "the document was updated" — say what \
+it says. Name figures, decisions and people where they appear.
+- `whyItMattersToMe`: what it concretely means for them — their area of the system, work \
+their review would unblock, anything contradicting a decision they made. If a change has no \
+bearing on them, say so plainly rather than inventing a connection.
+- `rank`: order across all items, 1 being what should most shape their day.
+- `priority`: `high` only for things genuinely waiting on them, or that cost time if missed \
+today.
+- `suggestedAction`: `blocked-on-me` only when the text explicitly asks them or their role \
+for something.
+- `tags`: at most four short keywords.
+
+`tldr` is one paragraph, at most five sentences, naming the two or three threads that matter \
+and who is driving them. No preamble, no "here is your digest", no bullet list.
+
+Never invent titles, URLs, authors or references. Use only the reference ids given."""
+
+
+# ---------------------------------------------------------------- small helpers
+
+
+def log(msg: str) -> None:
+    line = f"{datetime.now().astimezone().isoformat(timespec='seconds')}  {msg}"
+    print(line, file=sys.stderr)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def parse_iso(value: str) -> datetime:
+    """Outline sends `...Z`; older Pythons want an explicit offset."""
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
+def iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def write_json_atomic(path: Path, obj, mode: int = 0o600) -> None:
+    """Replace `path` in one step so a reader never sees a partial document."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_json(path: Path, fallback):
+    try:
+        with path.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+# ------------------------------------------------------------------ config/auth
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    cfg.update(load_json(CONFIG_PATH, {}))
+    if not cfg.get("baseUrl"):
+        die(f"no baseUrl in {CONFIG_PATH} — run bin/setup first")
+    cfg["baseUrl"] = cfg["baseUrl"].rstrip("/")
+    return cfg
+
+
+def die(msg: str, code: int = 1):
+    log(f"fatal: {msg}")
+    sys.exit(code)
+
+
+def get_token(cfg: dict) -> str:
+    cmd = cfg.get("tokenCommand", "").strip()
+    if not cmd:
+        die("no tokenCommand configured")
+    try:
+        out = subprocess.run(
+            ["bash", "-c", cmd], capture_output=True, text=True, timeout=20
+        )
+    except subprocess.TimeoutExpired:
+        die("tokenCommand timed out")
+    if out.returncode != 0:
+        die(f"tokenCommand failed: {out.stderr.strip()[:200]}")
+    token = out.stdout.strip()
+    if not token or token == "null":
+        die("tokenCommand produced no token")
+    # Accept either a bare token or a full `Bearer ...` header value.
+    return token if token.lower().startswith("bearer ") else f"Bearer {token}"
+
+
+class ApiError(Exception):
+    def __init__(self, reason: str, status: int | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
+def api(cfg: dict, token: str, method: str, body: dict, attempts: int = 5) -> dict:
+    """POST to the Outline API with backoff. Auth failures never retry."""
+    url = f"{cfg['baseUrl']}/api/{method}"
+    data = json.dumps(body).encode()
+    backoff = [5, 15, 30, 60]
+    last = None
+    for i in range(attempts):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": token,
+                "Content-Type": "application/json",
+                "User-Agent": f"{APP}/1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                payload = json.loads(resp.read().decode())
+            if payload.get("ok") is False:
+                status = payload.get("status")
+                if status in (401, 403):
+                    raise ApiError(f"auth rejected: {payload.get('message')}", status)
+                raise ApiError(f"{method}: {payload.get('message')}", status)
+            return payload
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise ApiError(f"auth rejected (HTTP {exc.code})", exc.code) from exc
+            last = ApiError(f"{method}: HTTP {exc.code}", exc.code)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            last = ApiError(f"{method}: {exc}")
+        if i < attempts - 1:
+            wait = backoff[min(i, len(backoff) - 1)]
+            log(f"  {last.reason} — retry in {wait}s")
+            time.sleep(wait)
+    raise last or ApiError(f"{method}: unreachable")
+
+
+# --------------------------------------------------------------------- fetching
+
+
+def fetch_changed(cfg, token, since: datetime, max_pages: int = 25) -> list[dict]:
+    """Newest-first paging, stopping at the watermark.
+
+    This instance silently ignores the documented `filters` parameter — an
+    absurd future cutoff still returns every document — so the date bound has
+    to be applied client-side. `sort`/`direction` do work, so walking DESC and
+    breaking at the first document older than the cutoff reads only the pages
+    that can contain changes.
+    """
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    limit = 100
+    for page in range(max_pages):
+        payload = api(
+            cfg,
+            token,
+            "documents.list",
+            {
+                "limit": limit,
+                "offset": page * limit,
+                "sort": "updatedAt",
+                "direction": "DESC",
+            },
+        )
+        batch = payload.get("data") or []
+        if not batch:
+            break
+        stop = False
+        for doc in batch:
+            updated = doc.get("updatedAt")
+            if not updated:
+                continue
+            if parse_iso(updated) <= since:
+                stop = True
+                break
+            if doc["id"] in seen_ids:
+                continue
+            seen_ids.add(doc["id"])
+            out.append(doc)
+        if stop or len(batch) < limit:
+            break
+    return out
+
+
+def resolve_me(cfg, token, state) -> dict:
+    me = state.get("me") or {}
+    if me.get("id"):
+        return me
+    info = api(cfg, token, "auth.info", {})
+    user = (info.get("data") or {}).get("user") or {}
+    return {"id": user.get("id", ""), "name": user.get("name", "")}
+
+
+def resolve_collections(cfg, token, state, force: bool = False) -> dict:
+    cached = state.get("collections") or {}
+    fetched_at = state.get("collectionsFetchedAt")
+    fresh = False
+    if fetched_at and not force:
+        try:
+            fresh = datetime.now(timezone.utc) - parse_iso(fetched_at) < timedelta(days=1)
+        except ValueError:
+            fresh = False
+    if cached and fresh:
+        return cached
+    try:
+        payload = api(cfg, token, "collections.list", {"limit": 100})
+    except ApiError:
+        return cached
+    return {c["id"]: c.get("name", "") for c in (payload.get("data") or []) if c.get("id")}
+
+
+# ------------------------------------------------------------- change detection
+
+
+def text_hash(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()[:32]
+
+
+def normalise(text: str) -> list[str]:
+    """Strip Outline noise so a diff shows prose changes, not markup churn."""
+    text = re.sub(r"/api/attachments\.redirect\?id=[0-9a-f-]+", "«attachment»", text)
+    text = re.sub(r"\\\s*$", "", text, flags=re.M)
+    text = re.sub(r"^:::[a-z]*\s*$", "", text, flags=re.M)
+    return [ln.rstrip() for ln in text.splitlines()]
+
+
+def classify(docs, state, me, cfg) -> list[dict]:
+    seen = state.get("seen") or {}
+    include_own = bool(cfg.get("includeOwnEdits"))
+    items = []
+    for doc in docs:
+        if doc.get("deletedAt") or doc.get("archivedAt") or doc.get("template"):
+            continue
+        if not doc.get("publishedAt"):
+            continue  # someone's private draft, not shared work
+        text = doc.get("text") or ""
+        if len(text.strip()) < MIN_TEXT_CHARS:
+            continue
+        editor = (doc.get("updatedBy") or {}).get("id")
+        if not include_own and editor and editor == me.get("id"):
+            collaborators = [c for c in (doc.get("collaboratorIds") or []) if c != me.get("id")]
+            if not collaborators:
+                continue
+        prior = seen.get(doc["id"])
+        digest = text_hash(text)
+        if prior is None:
+            kind = "new"
+        elif doc.get("revision", 0) > prior.get("revision", 0):
+            kind = "updated"
+        elif digest != prior.get("hash"):
+            # Outline does not bump `revision` for every metadata or title edit.
+            kind = "updated"
+        else:
+            continue
+        items.append({"doc": doc, "changeKind": kind, "hash": digest})
+    return items
+
+
+# ---------------------------------------------------------------- payload build
+
+
+def baseline_path(doc_id: str) -> Path:
+    return BASELINE_DIR / f"{doc_id}.md"
+
+
+def build_payload(items, collections, cfg) -> tuple[str, dict]:
+    """Render the LLM input and the ref→document map used to rejoin facts.
+
+    The model only ever sees and returns `D<n>` refs; every title, URL, author
+    and collection is joined back from our own data afterwards, so a
+    hallucinated link cannot reach the widget.
+    """
+    per_diff = int(cfg["perDocDiffChars"])
+    per_new = int(cfg["perDocNewChars"])
+    budget = int(cfg["payloadCharBudget"])
+
+    blocks, refmap, used = [], {}, 0
+    for index, item in enumerate(items, start=1):
+        doc = item["doc"]
+        ref = f"D{index}"
+        refmap[ref] = item
+        collection = collections.get(doc.get("collectionId") or "", "—")
+        author = (doc.get("updatedBy") or {}).get("name") or "—"
+        text = doc.get("text") or ""
+
+        if item["changeKind"] == "new":
+            body = text[:per_new]
+            if len(text) > per_new:
+                body += f"\n[… ingekort, nog {len(text) - per_new} tekens]"
+            kind_label = "NIEUWE PAGINA"
+        else:
+            old = ""
+            bp = baseline_path(doc["id"])
+            if bp.exists():
+                try:
+                    old = bp.read_text()
+                except OSError:
+                    old = ""
+            if old:
+                diff = "\n".join(
+                    difflib.unified_diff(
+                        normalise(old), normalise(text), lineterm="", n=3
+                    )
+                )
+                body = diff if diff.strip() else "(alleen metadata gewijzigd)"
+                kind_label = "WIJZIGING (unified diff)"
+            else:
+                body = text[:per_new]
+                kind_label = "GEWIJZIGD (geen eerdere versie bekend, volledige tekst)"
+            if len(body) > per_diff:
+                half = per_diff // 2
+                body = f"{body[:half]}\n[… {len(body) - per_diff} tekens overgeslagen …]\n{body[-half:]}"
+
+        block = (
+            f"### {ref} — {kind_label}\n"
+            f"titel: {doc.get('title', '')}\n"
+            f"collectie: {collection}\n"
+            f"auteur: {author}\n"
+            f"bijgewerkt: {doc.get('updatedAt', '')}\n\n"
+            f"{body}\n"
+        )
+        if used + len(block) > budget:
+            log(f"  payload budget reached at {ref}; {len(items) - index + 1} blocks dropped")
+            for dropped in range(index, len(items) + 1):
+                refmap.pop(f"D{dropped}", None)
+            break
+        blocks.append(block)
+        used += len(block)
+
+    header = (
+        f"Wijzigingen op de wiki, {len(blocks)} document(en).\n"
+        "Lever precies één item per referentie.\n\n"
+    )
+    return header + "\n".join(blocks), refmap
+
+
+# ------------------------------------------------------------------------- LLM
+
+
+def find_claude(cfg) -> str | None:
+    if cfg.get("claudeBin"):
+        return cfg["claudeBin"] if Path(cfg["claudeBin"]).exists() else None
+    # The ~/.local/bin shim runs `mise use -g claude`, which mutates global
+    # config and needs the network — never safe from a unit. Prefer the real
+    # install, and fall back to whatever is on PATH that is not that shim.
+    mise = HOME / ".local/share/mise/installs/claude/latest/claude"
+    if mise.exists():
+        return str(mise)
+    from shutil import which
+
+    found = which("claude")
+    if found and "shims" not in found:
+        return found
+    return None
+
+
+def call_claude(payload: str, cfg: dict, name: str, model: str) -> dict:
+    binary = find_claude(cfg)
+    if not binary:
+        raise RuntimeError("claude binary not found")
+    template = PROMPT_NL if cfg.get("language") == "nl" else PROMPT_EN
+    system = template.format(name=name or "de gebruiker", persona=cfg.get("persona", ""))
+    cmd = [
+        binary,
+        "-p",
+        "--output-format", "json",
+        "--json-schema", json.dumps(OUTPUT_SCHEMA),
+        "--system-prompt", system,
+        "--model", model,
+        "--tools", "",
+        "--permission-mode", "dontAsk",
+        "--strict-mcp-config",
+        "--mcp-config", '{"mcpServers":{}}',
+        "--setting-sources", "",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--max-budget-usd", str(cfg["maxBudgetUsd"]),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=int(cfg["llmTimeoutSec"]),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("llm_timeout") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("claude binary not found") from exc
+
+    if not proc.stdout.strip():
+        raise RuntimeError(f"no output (rc={proc.returncode}) {proc.stderr.strip()[:200]}")
+    try:
+        env = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("malformed envelope") from exc
+    # A failed run can still report subtype "success" with a non-error exit
+    # shape, so `is_error` is the only reliable gate.
+    if env.get("is_error"):
+        raise RuntimeError(
+            f"api error {env.get('api_error_status', '')}: {str(env.get('result'))[:200]}"
+        )
+    out = env.get("structured_output")
+    if not out:
+        try:
+            out = json.loads(env.get("result") or "")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("no structured output") from exc
+    if not isinstance(out, dict) or "items" not in out:
+        raise RuntimeError("structured output missing items")
+    return out
+
+
+# ------------------------------------------------------------------ digest join
+
+
+def doc_url(cfg, doc) -> str:
+    url = doc.get("url")
+    if url:
+        return f"{cfg['baseUrl']}{url}" if url.startswith("/") else url
+    return f"{cfg['baseUrl']}/doc/{doc.get('urlId', '')}"
+
+
+def base_item(cfg, item, collections) -> dict:
+    doc = item["doc"]
+    return {
+        "id": doc["id"],
+        "url": doc_url(cfg, doc),
+        "title": doc.get("title") or "(zonder titel)",
+        "collection": {"name": collections.get(doc.get("collectionId") or "", "—")},
+        "author": {"name": (doc.get("updatedBy") or {}).get("name") or "—"},
+        "changeKind": item["changeKind"],
+        "updatedAt": doc.get("updatedAt"),
+    }
+
+
+def join_llm(cfg, llm, refmap, collections) -> list[dict]:
+    items, matched = [], set()
+    for row in llm.get("items") or []:
+        ref = row.get("ref")
+        item = refmap.get(ref)
+        if not item:
+            continue
+        matched.add(ref)
+        entry = base_item(cfg, item, collections)
+        entry.update(
+            {
+                "rank": int(row.get("rank") or 999),
+                "priority": row.get("priority") or "low",
+                "summary": row.get("summary") or "",
+                "whyItMattersToMe": row.get("whyItMattersToMe") or "",
+                "suggestedAction": row.get("suggestedAction") or "fyi",
+                "tags": row.get("tags") or [],
+            }
+        )
+        items.append(entry)
+    # A document the model skipped still gets a row, so the list stays complete.
+    for ref, item in refmap.items():
+        if ref in matched:
+            continue
+        entry = base_item(cfg, item, collections)
+        entry.update(
+            {
+                "rank": 900 + len(items),
+                "priority": "low",
+                "summary": (item["doc"].get("text") or "")[:140].replace("\n", " "),
+                "whyItMattersToMe": "",
+                "suggestedAction": "fyi",
+                "tags": [],
+            }
+        )
+        items.append(entry)
+    items.sort(key=lambda row: row["rank"])
+    for position, row in enumerate(items, start=1):
+        row["rank"] = position
+    return items
+
+
+def mechanical_items(cfg, refmap, collections) -> list[dict]:
+    items = []
+    ordered = sorted(
+        refmap.values(), key=lambda i: i["doc"].get("updatedAt") or "", reverse=True
+    )
+    for position, item in enumerate(ordered, start=1):
+        entry = base_item(cfg, item, collections)
+        entry.update(
+            {
+                "rank": position,
+                "priority": "low",
+                "summary": (item["doc"].get("text") or "")[:140].replace("\n", " "),
+                "whyItMattersToMe": "",
+                "suggestedAction": "fyi",
+                "tags": [],
+            }
+        )
+        items.append(entry)
+    return items
+
+
+# ------------------------------------------------------------------ the commit
+
+
+def commit(state, items, watermark: datetime, collections, me, status: str) -> None:
+    """Advance the cursor, the baselines and the stamp together.
+
+    Called only once `digest.json` is on disk. Until this runs a failed attempt
+    is indistinguishable from never having run, which is what makes the hourly
+    retry safe.
+    """
+    seen = state.setdefault("seen", {})
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    for item in items:
+        doc = item["doc"]
+        seen[doc["id"]] = {
+            "revision": doc.get("revision", 0),
+            "updatedAt": doc.get("updatedAt"),
+            "title": doc.get("title"),
+            "hash": item["hash"],
+            "lastReported": today,
+        }
+        try:
+            baseline_path(doc["id"]).write_text(doc.get("text") or "")
+        except OSError as exc:
+            log(f"  baseline write failed for {doc['id']}: {exc}")
+
+    state["watermark"] = {"updatedAt": iso_utc(watermark)}
+    state["collections"] = collections
+    state["collectionsFetchedAt"] = iso_utc(datetime.now(timezone.utc))
+    state["me"] = me
+    state["schemaVersion"] = SCHEMA_VERSION
+    state["lastRun"] = {
+        "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": status,
+        "itemCount": len(items),
+    }
+    state["failures"] = {"consecutive": 0, "lastError": None, "lastErrorAt": None}
+    prune_baselines(state)
+    write_json_atomic(STATE_PATH, state)
+
+
+def prune_baselines(state) -> None:
+    keep = set(state.get("seen") or {})
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=int(state.get("baselineRetentionDays", DEFAULTS["baselineRetentionDays"]))
+    )
+    if not BASELINE_DIR.exists():
+        return
+    for path in BASELINE_DIR.glob("*.md"):
+        if path.stem in keep:
+            continue
+        try:
+            if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def record_failure(state, reason: str, cfg) -> None:
+    failures = state.setdefault("failures", {"consecutive": 0})
+    failures["consecutive"] = int(failures.get("consecutive", 0)) + 1
+    failures["lastError"] = reason
+    failures["lastErrorAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    state["schemaVersion"] = SCHEMA_VERSION
+    try:
+        write_json_atomic(STATE_PATH, state)
+    except OSError:
+        pass
+    # The one notification this system ever sends. A silently dead credential
+    # is exactly how the previous API key rotted unnoticed.
+    if failures["consecutive"] == int(cfg["notifyAfterFailures"]):
+        try:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "-u", "critical",
+                    "Wiki digest",
+                    f"{failures['consecutive']} dagen mislukt: {reason}",
+                ],
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def summon_overlay() -> None:
+    # `qs` matches shell instances by config-path string, so OMARCHY_PATH has to
+    # be the spelling the shell was launched with. The ~/.local/share/omarchy
+    # symlink points at the same directory but does not match, which looks
+    # exactly like "the shell is not running". Default to the real path.
+    env = dict(os.environ)
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    try:
+        subprocess.run(
+            ["omarchy-shell", "-q", "shell", "summon", "jevido.wiki", "{}"],
+            timeout=15,
+            check=False,
+            capture_output=True,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"  overlay summon skipped: {exc}")
+
+
+def write_digest(payload: dict) -> None:
+    if DIGEST_PATH.exists():
+        try:
+            DIGEST_PREV_PATH.write_bytes(DIGEST_PATH.read_bytes())
+            os.chmod(DIGEST_PREV_PATH, 0o600)
+        except OSError:
+            pass
+    write_json_atomic(DIGEST_PATH, payload)
+
+
+# -------------------------------------------------------------------- commands
+
+
+def cmd_run(args) -> int:
+    cfg = load_config()
+    if args.claude_bin:
+        cfg["claudeBin"] = args.claude_bin
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    lock = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another run holds the lock; nothing to do")
+        return 0
+
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    stamp = STAMP_PATH.read_text().strip() if STAMP_PATH.exists() else ""
+    if stamp == today and not args.force:
+        # Deliberately does NOT summon the overlay. The retry lines at 10:00
+        # through 13:00 all land here on a good day, and re-opening a digest
+        # the user already dismissed would turn one interruption a day into
+        # five. Re-opening it is the bar widget's job, on request.
+        log(f"digest for {today} already generated")
+        return 0
+
+    state = load_json(STATE_PATH, {})
+    token = get_token(cfg)
+
+    # Window: explicit override, else the stored watermark, else a bootstrap.
+    if args.window:
+        since = datetime.now(timezone.utc) - parse_duration(args.window)
+    else:
+        stored = (state.get("watermark") or {}).get("updatedAt")
+        if stored:
+            since = parse_iso(stored) - timedelta(minutes=5)
+        else:
+            since = datetime.now(timezone.utc) - timedelta(days=int(cfg["bootstrapDays"]))
+    log(f"looking for changes since {iso_utc(since)}")
+
+    try:
+        me = resolve_me(cfg, token, state)
+        collections = resolve_collections(cfg, token, state)
+        docs = fetch_changed(cfg, token, since)
+    except ApiError as exc:
+        reason = "auth_failed" if exc.status in (401, 403) else "wiki_unreachable"
+        log(f"fetch failed ({reason}): {exc.reason}")
+        record_failure(state, f"{reason}: {exc.reason}", cfg)
+        return 2
+
+    newest = since
+    for doc in docs:
+        try:
+            newest = max(newest, parse_iso(doc["updatedAt"]))
+        except (KeyError, ValueError):
+            pass
+
+    items = classify(docs, state, me, cfg)
+    log(f"{len(docs)} document(s) in window, {len(items)} relevant after filtering")
+
+    max_items = int(cfg["maxItems"])
+    omitted = 0
+    summarise = items
+    if len(items) > max_items:
+        summarise = sorted(items, key=lambda i: i["doc"].get("updatedAt") or "", reverse=True)[:max_items]
+        omitted = len(items) - max_items
+        log(f"  capping at {max_items}, {omitted} omitted (all still marked seen)")
+
+    # An empty day is a success: the stamp is written and the cursor advances,
+    # so tomorrow does not re-report today.
+    if not summarise:
+        digest = {
+            "schemaVersion": SCHEMA_VERSION,
+            "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "coversSince": iso_utc(since),
+            "status": "empty",
+            "degradedReason": None,
+            "stats": {
+                "documentsChanged": 0, "documentsSummarized": 0, "documentsOmitted": 0,
+                "collections": 0, "authors": 0,
+                "daysCovered": max(1, (datetime.now(timezone.utc) - since).days),
+            },
+            "tldr": "Geen wijzigingen op de wiki sinds je vorige overzicht."
+            if cfg.get("language") == "nl"
+            else "No wiki changes since your last digest.",
+            "items": [],
+        }
+        if args.dry_run:
+            print(json.dumps(digest, ensure_ascii=False, indent=2))
+            return 0
+        write_digest(digest)
+        commit(state, [], newest, collections, me, "empty")
+        STAMP_PATH.write_text(today + "\n")
+        if args.show:
+            summon_overlay()
+        return 0
+
+    payload, refmap = build_payload(summarise, collections, cfg)
+    try:
+        PAYLOAD_PATH.write_text(payload)
+        os.chmod(PAYLOAD_PATH, 0o600)
+    except OSError:
+        pass
+
+    if args.dry_run:
+        print(payload)
+        log(f"dry run: {len(refmap)} block(s), {len(payload)} chars — no LLM call")
+        return 0
+
+    status, degraded, llm = "ok", None, None
+    for attempt, model in enumerate([cfg["model"], cfg["fallbackModel"]]):
+        try:
+            log(f"summarising with {model} ({len(payload)} chars)")
+            llm = call_claude(payload, cfg, me.get("name", ""), model)
+            break
+        except RuntimeError as exc:
+            reason = str(exc)
+            log(f"  {model} failed: {reason}")
+            if attempt == 0:
+                time.sleep(30)
+            else:
+                status = "degraded"
+                degraded = "llm_timeout" if "timeout" in reason else "llm_unavailable"
+
+    if llm is not None:
+        items_out = join_llm(cfg, llm, refmap, collections)
+        tldr = (llm.get("tldr") or "").strip()
+    else:
+        items_out = mechanical_items(cfg, refmap, collections)
+        count = len(items_out)
+        tldr = (
+            f"{count} pagina('s) gewijzigd; samenvattingen zijn nu niet beschikbaar."
+            if cfg.get("language") == "nl"
+            else f"{count} page(s) changed; summaries unavailable."
+        )
+
+    if omitted:
+        degraded = degraded or "truncated"
+
+    digest = {
+        "schemaVersion": SCHEMA_VERSION,
+        "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "coversSince": iso_utc(since),
+        "status": status,
+        "degradedReason": degraded,
+        "stats": {
+            "documentsChanged": len(items),
+            "documentsSummarized": len(items_out),
+            "documentsOmitted": omitted,
+            "collections": len({i["collection"]["name"] for i in items_out}),
+            "authors": len({i["author"]["name"] for i in items_out}),
+            "daysCovered": max(1, (datetime.now(timezone.utc) - since).days),
+        },
+        "tldr": tldr,
+        "items": items_out,
+    }
+    write_digest(digest)
+    commit(state, items, newest, collections, me, status)
+
+    # A degraded digest deliberately leaves the stamp unset, so the next
+    # scheduled retry upgrades it in place rather than skipping the day.
+    if status == "ok":
+        STAMP_PATH.write_text(today + "\n")
+    else:
+        log("degraded: leaving today's stamp unset so a retry can upgrade it")
+
+    log(f"wrote {DIGEST_PATH} ({len(items_out)} item(s), status={status})")
+    if args.show:
+        summon_overlay()
+    return 0
+
+
+def parse_duration(text: str) -> timedelta:
+    """Accept the ISO 8601 durations the CLI takes, e.g. P7D, PT1M, P1DT2H."""
+    match = re.fullmatch(
+        r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", text.strip().upper()
+    )
+    if not match:
+        die(f"not an ISO 8601 duration: {text}")
+    days, hours, minutes, seconds = (int(g or 0) for g in match.groups())
+    if not any((days, hours, minutes, seconds)):
+        die(f"duration is zero: {text}")
+    return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+
+
+def cmd_pulse(_args) -> int:
+    """Count changes since the last digest. No LLM, no state mutation.
+
+    Deliberately touches neither the watermark, the baselines nor the stamp —
+    the badge must never be able to consume a change the morning digest still
+    owes the user.
+    """
+    cfg = load_config()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    digest = load_json(DIGEST_PATH, {})
+    state = load_json(STATE_PATH, {})
+
+    anchor_raw = digest.get("generatedAt") or (state.get("watermark") or {}).get("updatedAt")
+    if not anchor_raw:
+        write_json_atomic(
+            PULSE_PATH,
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "checkedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "newSinceDigest": 0,
+                "health": "nodigest",
+                "digestAge": None,
+            },
+            0o644,
+        )
+        return 0
+    anchor = parse_iso(anchor_raw)
+
+    health, count = "ok", 0
+    try:
+        token = get_token(cfg)
+        me = state.get("me") or {}
+        docs = fetch_changed(cfg, token, anchor, max_pages=3)
+        count = len(classify(docs, state, me, cfg))
+    except (ApiError, SystemExit) as exc:
+        health = "stale"
+        log(f"pulse: {exc}")
+
+    age = datetime.now(timezone.utc) - anchor
+    write_json_atomic(
+        PULSE_PATH,
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "checkedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "newSinceDigest": count,
+            "health": health,
+            "digestAge": f"PT{int(age.total_seconds() // 3600)}H{int(age.total_seconds() % 3600 // 60)}M",
+        },
+        0o644,
+    )
+    return 0
+
+
+def cmd_mark_read(_args) -> int:
+    """Record that the digest on screen has been seen.
+
+    The overlay calls this on dismiss rather than writing the file itself, so
+    there stays exactly one writer per file in the state directory.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    digest = load_json(DIGEST_PATH, {})
+    write_json_atomic(
+        READ_PATH,
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "readAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "digestGeneratedAt": digest.get("generatedAt", ""),
+            "ids": [item.get("id") for item in (digest.get("items") or [])],
+        },
+        0o644,
+    )
+    return 0
+
+
+def cmd_status(_args) -> int:
+    state = load_json(STATE_PATH, {})
+    digest = load_json(DIGEST_PATH, {})
+    stamp = STAMP_PATH.read_text().strip() if STAMP_PATH.exists() else "(none)"
+    print(f"config      {CONFIG_PATH}  {'ok' if CONFIG_PATH.exists() else 'MISSING'}")
+    print(f"last-success {stamp}")
+    print(f"watermark   {(state.get('watermark') or {}).get('updatedAt', '(none)')}")
+    print(f"last run    {state.get('lastRun', '(never)')}")
+    print(f"failures    {state.get('failures', {}).get('consecutive', 0)}")
+    print(f"seen docs   {len(state.get('seen') or {})}")
+    print(f"digest      {digest.get('generatedAt', '(none)')} status={digest.get('status', '-')} items={len(digest.get('items') or [])}")
+    return 0
+
+
+def cmd_reset(args) -> int:
+    if not args.yes:
+        print("refusing without --yes; this clears the watermark and baselines", file=sys.stderr)
+        return 1
+    for path in (STATE_PATH, STAMP_PATH, PAYLOAD_PATH):
+        path.unlink(missing_ok=True)
+    if BASELINE_DIR.exists():
+        for baseline in BASELINE_DIR.glob("*.md"):
+            baseline.unlink(missing_ok=True)
+    print("state cleared; the next run bootstraps")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog=APP, description=__doc__)
+    sub = parser.add_subparsers(dest="command")
+
+    run = sub.add_parser("run", help="generate today's digest")
+    run.add_argument("--force", action="store_true", help="ignore today's stamp")
+    run.add_argument("--dry-run", action="store_true", help="print the payload, call no LLM")
+    run.add_argument("--window", metavar="ISO8601", help="override the watermark, e.g. P7D")
+    run.add_argument("--claude-bin", metavar="PATH", help="override the claude binary")
+    run.add_argument("--no-show", dest="show", action="store_false", help="do not summon the overlay")
+    run.set_defaults(func=cmd_run, show=True)
+
+    pulse = sub.add_parser("pulse", help="refresh the badge count only")
+    pulse.set_defaults(func=cmd_pulse)
+
+    mark = sub.add_parser("mark-read", help="clear the badge for the current digest")
+    mark.set_defaults(func=cmd_mark_read)
+
+    status = sub.add_parser("status", help="show cursor and last run")
+    status.set_defaults(func=cmd_status)
+
+    reset = sub.add_parser("reset", help="clear the watermark and baselines")
+    reset.add_argument("--yes", action="store_true")
+    reset.set_defaults(func=cmd_reset)
+
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 1
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

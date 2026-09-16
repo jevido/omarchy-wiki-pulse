@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily wiki digest at 09:00, or at boot if that was missed
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+# Retry window. The once-per-day stamp makes these no-ops on a day that already
+# produced a digest, so they only do work after a failed or skipped 09:00.
+OnCalendar=*-*-* 10,11,12,13:00:00
+# Fire immediately when an elapse was missed — the machine being off at 09:00
+# is the normal case, not the exception.
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

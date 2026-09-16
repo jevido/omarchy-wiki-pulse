@@ -1,0 +1,5 @@
+#!/bin/bash
+# Badge-only refresh: counts what changed since the morning digest and writes
+# pulse.json. Shares the digest's fetch and auth layer so there is one
+# implementation of "what counts as a change", not two that can drift.
+exec "$(dirname "$(readlink -f "$0")")/omarchy-wiki-digest" pulse "$@"

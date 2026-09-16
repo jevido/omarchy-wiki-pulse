@@ -1,0 +1,20 @@
+[Unit]
+Description=Generate the daily wiki digest for the Omarchy bar
+
+[Service]
+Type=oneshot
+# User services get a minimal PATH; the script needs python3, jq and omarchy-shell.
+Environment=PATH=/usr/bin:/usr/local/bin:%h/.local/bin
+# The omarchy-shell wrapper refuses to run without this, and it is not in the
+# environment a user unit inherits. It must be the path the shell was actually
+# launched with -- qs matches instances by config path string, so the
+# ~/.local/share/omarchy symlink to the same directory does NOT match.
+Environment=OMARCHY_PATH=/usr/share/omarchy
+ExecStart=%h/.local/bin/omarchy-wiki-digest run
+# The LLM call is capped at 300s; this leaves room for fetch retries on a slow
+# network without ever hanging the boot path.
+TimeoutStartSec=900
+Nice=10
+IOSchedulingClass=idle
+# Restart= is illegal with Type=oneshot, so retries live inside the script and
+# in the timer's extra OnCalendar lines.

@@ -1,0 +1,5 @@
+#!/bin/bash
+# The digest fires at 09:00 or at boot, whichever comes first. This is the boot
+# half. The script's own once-per-day stamp makes the 09:00 run a no-op when
+# this already produced today's digest, and vice versa.
+systemctl --user start --no-block omarchy-wiki-digest.service || true

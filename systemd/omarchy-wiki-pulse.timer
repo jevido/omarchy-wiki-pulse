@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll the wiki for the bar badge every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+# One catch-up after suspend is enough; the badge is not history.
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

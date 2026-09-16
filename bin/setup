@@ -1,0 +1,74 @@
+#!/bin/bash
+# Install the digest pipeline: two binaries, four systemd units, one post-boot
+# hook, and a config file.
+#
+# This is a separate step on purpose. `omarchy plugin add` never runs plugin
+# code or install hooks, and quietly writing systemd units behind that warning
+# would be a bad way to repay the trust. So: print what will be written, then
+# write it. Idempotent — safe to re-run after every update.
+
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+BIN_DIR="$HOME/.local/bin"
+UNIT_DIR="$HOME/.config/systemd/user"
+HOOK_DIR="$HOME/.config/omarchy/hooks/post-boot.d"
+CONFIG="$HOME/.config/omarchy/wiki-digest.json"
+ASSUME_YES=0
+
+[[ ${1:-} == "--yes" || ${1:-} == "-y" ]] && ASSUME_YES=1
+
+say() { printf '%s\n' "$*"; }
+
+cat <<INFO
+omarchy-wiki-digest setup
+
+  source      $PLUGIN_DIR
+  binaries    $BIN_DIR/omarchy-wiki-{digest,pulse}   (symlinks)
+  units       $UNIT_DIR/omarchy-wiki-{digest,pulse}.{service,timer}
+  boot hook   $HOOK_DIR/omarchy-wiki-digest
+  config      $CONFIG $( [[ -f $CONFIG ]] && echo "(exists, left alone)" || echo "(will be created)" )
+
+The timer runs at 09:00 with retries until 13:00; the hook covers boot. Nothing
+runs as root and no file outside your home directory is touched.
+
+INFO
+
+if (( ! ASSUME_YES )); then
+  read -rp "Install? [y/N] " reply
+  [[ $reply =~ ^[Yy]$ ]] || { say "aborted"; exit 1; }
+fi
+
+mkdir -p "$BIN_DIR" "$UNIT_DIR" "$HOOK_DIR" "$(dirname "$CONFIG")"
+
+for tool in omarchy-wiki-digest omarchy-wiki-pulse; do
+  ln -sfn "$PLUGIN_DIR/bin/$tool" "$BIN_DIR/$tool"
+  say "linked  $BIN_DIR/$tool"
+done
+
+for unit in "$PLUGIN_DIR"/systemd/*.{service,timer}; do
+  install -m 644 "$unit" "$UNIT_DIR/$(basename "$unit")"
+  say "wrote   $UNIT_DIR/$(basename "$unit")"
+done
+
+install -m 755 "$PLUGIN_DIR/hooks/omarchy-wiki-digest" "$HOOK_DIR/omarchy-wiki-digest"
+say "wrote   $HOOK_DIR/omarchy-wiki-digest"
+
+if [[ ! -f $CONFIG ]]; then
+  install -m 600 "$PLUGIN_DIR/wiki-digest.example.json" "$CONFIG"
+  say "wrote   $CONFIG  — edit baseUrl and tokenCommand before the first run"
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable --now omarchy-wiki-digest.timer omarchy-wiki-pulse.timer
+say
+say "timers enabled:"
+systemctl --user list-timers --no-pager 'omarchy-wiki-*' | sed '1d;/^$/,$d' || true
+
+cat <<'NEXT'
+
+Next:
+  1. Edit ~/.config/omarchy/wiki-digest.json  (baseUrl, tokenCommand, persona, language)
+  2. omarchy-wiki-digest run --window P7D --dry-run   # proves auth, no LLM call
+  3. omarchy plugin enable jevido.wiki                # puts the widget on the bar
+NEXT

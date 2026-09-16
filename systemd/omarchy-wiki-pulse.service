@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the wiki digest badge count
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/bin:/usr/local/bin:%h/.local/bin
+ExecStart=%h/.local/bin/omarchy-wiki-pulse
+TimeoutStartSec=180
+Nice=15
+IOSchedulingClass=idle

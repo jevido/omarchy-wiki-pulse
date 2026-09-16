@@ -1,0 +1,9 @@
+{
+  "baseUrl": "https://wiki.example.com",
+  "tokenCommand": "echo $OUTLINE_API_KEY",
+  "language": "en",
+  "persona": "software engineer",
+  "maxItems": 40,
+  "includeOwnEdits": false,
+  "bootstrapDays": 7
+}

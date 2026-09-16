@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "jevido.wiki",
+  "name": "Wiki Pulse",
+  "version": "1.0.0",
+  "author": "Jeffrey Duivenvoorden",
+  "description": "A daily digest of what your colleagues wrote on the wiki — fullscreen each morning, a silent badge the rest of the day",
+  "kinds": ["bar-widget", "overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "overlay": "Overlay.qml"
+  },
+  "barWidget": {
+    "displayName": "Wiki Pulse",
+    "description": "Unread wiki changes since the morning digest",
+    "category": "Information",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "glyph": "󰖝",
+      "hideWhenEmpty": true
+    },
+    "schema": [
+      { "key": "glyph", "type": "string", "label": "Bar icon" },
+      { "key": "hideWhenEmpty", "type": "boolean", "label": "Hide the widget when there is nothing new" }
+    ]
+  }
+}
