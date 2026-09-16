@@ -5,7 +5,10 @@
   "version": "1.0.0",
   "author": "Jeffrey Duivenvoorden",
   "description": "A daily digest of what your colleagues wrote on the wiki — fullscreen each morning, a silent badge the rest of the day",
-  "kinds": ["bar-widget", "overlay"],
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "barWidget": "BarWidget.qml",
@@ -18,12 +21,20 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "glyph": "󰖝",
-      "hideWhenEmpty": true
+      "glyph": "󰂺",
+      "hideWhenEmpty": false
     },
     "schema": [
-      { "key": "glyph", "type": "string", "label": "Bar icon" },
-      { "key": "hideWhenEmpty", "type": "boolean", "label": "Hide the widget when there is nothing new" }
+      {
+        "key": "glyph",
+        "type": "string",
+        "label": "Bar icon"
+      },
+      {
+        "key": "hideWhenEmpty",
+        "type": "boolean",
+        "label": "Hide the widget when there is nothing new"
+      }
     ]
   }
 }

@@ -16,8 +16,11 @@ BarWidget {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string dataDir: home + "/.local/share/omarchy-wiki-digest"
-  readonly property string glyph: setting("glyph", "󰖝")
-  readonly property bool hideWhenEmpty: setting("hideWhenEmpty", true)
+  readonly property string glyph: setting("glyph", "󰂺")
+  // Off by default: this is the only way back into today's digest once it has
+  // been dismissed, so a widget that disappears on a quiet day takes the door
+  // with it. Opt in if you would rather reclaim the bar space.
+  readonly property bool hideWhenEmpty: setting("hideWhenEmpty", false)
 
   property var digest: Model.EMPTY
   property var pulse: ({ newSinceDigest: 0, health: "ok" })
@@ -35,7 +38,7 @@ BarWidget {
   readonly property int count: unreadDigest + sinceDigest
   readonly property bool stale: pulse.health === "stale"
 
-  visible: root.hideWhenEmpty ? count > 0 : true
+  visible: !root.hideWhenEmpty || count > 0
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -97,12 +100,15 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.count > 0 ? root.glyph + "  " + root.count : root.glyph
+    text: root.count > 0 && !root.vertical ? root.glyph + "  " + root.count : root.glyph
     labelVisible: !root.vertical
     hasVisualContent: true
-    // A greyed badge is honest about a wiki we could not reach; a confident
-    // count we cannot back up would be worse than no count.
-    opacity: root.stale ? 0.45 : 1.0
+    // Three states worth telling apart at a glance: something new (full
+    // strength), nothing new (present but receding), and a wiki we could not
+    // reach (clearly dimmed -- a confident count we cannot back up would be
+    // worse than no count).
+    opacity: root.stale ? 0.4 : (root.count > 0 ? 1.0 : 0.62)
+    Behavior on opacity { NumberAnimation { duration: 180 } }
     tooltipText: {
       if (root.stale) return qsTr("Wiki unreachable — count may be out of date")
       if (root.count === 0) return qsTr("Nothing new on the wiki")

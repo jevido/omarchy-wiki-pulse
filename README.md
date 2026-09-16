@@ -115,6 +115,16 @@ exact model input, for when a summary looks wrong).
 ~/.local/state/omarchy-wiki-digest/             watermark, baselines, daily stamp, log
 ```
 
+## The widget
+
+The bar icon is always there, so today's digest is always one click away — left
+click reopens it, right click refreshes the count. When something is new the
+icon carries a count and brightens; when the wiki cannot be reached it dims,
+because a confident count we cannot back up is worse than no count.
+
+Set `hideWhenEmpty` to `true` in the layout entry if you would rather it
+disappear on a quiet day and reclaim the bar space.
+
 ## Keys
 
 `↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `Esc` or **Got it**
