@@ -128,15 +128,8 @@ disappear on a quiet day and reclaim the bar space.
 ### Keyboard shortcut
 
 There is no shortcut out of the box — bind one yourself, since which keys are
-free is personal. In `~/.config/hypr/bindings.lua`:
-
-```lua
-o.bind("SUPER + D", "Wiki digest", "omarchy-shell shell toggle jevido.wiki")
-```
-
-Then set `shortcut` in the layout entry to the same keys so the tooltip
-advertises it (`"shortcut": "Super+D"`). It is display text only — the binding
-is what makes it work.
+free is personal. See [hypr/](hypr/) for the binding and the layer rule that
+stops the compositor fading the overlay on top of its own animation.
 
 On a quiet day the digest shows an illustration rather than a blank panel.
 `empty.svg` is an ordinary SVG with `{{accent}}`, `{{fg}}`, `{{bg}}` and
