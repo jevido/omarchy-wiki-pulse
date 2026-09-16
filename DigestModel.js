@@ -28,13 +28,36 @@ function parse(raw) {
   }
 }
 
-function parseIds(raw) {
+var EMPTY_READ = { readAt: "", digestGeneratedAt: "", ids: [], pulseSeen: [] }
+
+// What the reader has already cleared. Absent or unreadable means "nothing
+// read", which errs towards showing a change twice rather than swallowing it.
+function parseRead(raw) {
+  if (!raw) return EMPTY_READ
   try {
     var parsed = JSON.parse(raw)
-    return Array.isArray(parsed.ids) ? parsed.ids : []
+    if (!parsed || typeof parsed !== "object") return EMPTY_READ
+    return {
+      readAt: parsed.readAt || "",
+      digestGeneratedAt: parsed.digestGeneratedAt || "",
+      ids: Array.isArray(parsed.ids) ? parsed.ids : [],
+      pulseSeen: Array.isArray(parsed.pulseSeen) ? parsed.pulseSeen : []
+    }
   } catch (e) {
-    return []
+    return EMPTY_READ
   }
+}
+
+// The read record belongs to one digest. A newer digest has never been read,
+// however many ids the old record happens to carry -- ids can repeat when the
+// same page changes again.
+function unreadItems(digest, read) {
+  var items = digest.items || []
+  if (!read || read.digestGeneratedAt !== (digest.generatedAt || "")) return items.slice()
+  var ids = read.ids || []
+  return items.filter(function (item) {
+    return ids.indexOf(item.id) === -1
+  })
 }
 
 var EMPTY_PULSE = { newSinceDigest: 0, health: "ok", items: [] }
@@ -54,15 +77,6 @@ function parsePulse(raw) {
     }
   } catch (e) {
     return EMPTY_PULSE
-  }
-}
-
-function parsePulseSeen(raw) {
-  try {
-    var parsed = JSON.parse(raw)
-    return Array.isArray(parsed.pulseSeen) ? parsed.pulseSeen : []
-  } catch (e) {
-    return []
   }
 }
 
@@ -91,6 +105,27 @@ function unseenPulseCount(pulse, seen) {
 
 function freshHeading(language) {
   return language === "nl" ? "Sinds vanochtend" : "Since this morning"
+}
+
+// The two things the overlay can be showing. Unread is the door you come in
+// through; everything is the briefing itself, re-readable all day.
+function modeLabel(showingAll, language) {
+  var nl = language === "nl"
+  if (showingAll) return nl ? "Alleen ongelezen" : "Unread only"
+  return nl ? "Alles" : "Everything"
+}
+
+function modeHint(showingAll, language) {
+  var nl = language === "nl"
+  if (showingAll) return nl ? "p ongelezen" : "p unread"
+  return nl ? "p alles" : "p everything"
+}
+
+// Points at the other view rather than just stating the obvious: an inbox that
+// is empty because you read it has nowhere else to say where the day went.
+function caughtUpHint(language) {
+  return language === "nl" ? "p toont het volledige overzicht"
+                           : "p shows the full digest"
 }
 
 // Says why these rows read differently from the ones above them, so a missing
@@ -156,15 +191,16 @@ function relativeTime(iso, language) {
 }
 
 // The count is rendered as its own large numeral, so the headline must not
-// repeat it -- "7  7 wijzigingen" reads as a bug.
-function headlineFor(digest, language, extra) {
+// repeat it -- "7  7 wijzigingen" reads as a bug. `count` is what is actually
+// on screen, which depends on the view: the status words describe the day, and
+// a day with seven changes you have already read is not a quiet one.
+function headlineFor(digest, language, count) {
   var nl = language === "nl"
-  var n = (digest.items || []).length + (extra || 0)
-  // The status words describe a day with nothing on it; anything the pulse
-  // picked up after the digest was built makes that untrue.
+  var n = count || 0
   if (n === 0) {
-    if (digest.status === "empty") return nl ? "Rustig op de wiki" : "Quiet on the wiki"
     if (digest.status === "nodigest") return nl ? "Nog geen overzicht" : "No digest yet"
+    if (digest.status === "empty") return nl ? "Rustig op de wiki" : "Quiet on the wiki"
+    return nl ? "Alles gelezen" : "All caught up"
   }
   if (nl) return n === 1 ? "wijziging" : "wijzigingen"
   return n === 1 ? "change" : "changes"
@@ -208,7 +244,18 @@ function degradedNotice(digest, language) {
 // "woensdag 16 september, 09:00" -- enough to tell two digests apart at a
 // glance without turning the header into a timestamp.
 function digestDate(digest, language) {
-  var raw = digest && digest.generatedAt
+  return formatMoment(digest && digest.generatedAt, language)
+}
+
+// Where the briefing starts. Watermark-based, so after a week away this says
+// last Tuesday rather than pretending the window is always a day.
+function coverageFor(digest, language) {
+  var when = formatMoment(digest && digest.coversSince, language)
+  if (!when) return ""
+  return (language === "nl" ? "sinds " : "since ") + when
+}
+
+function formatMoment(raw, language) {
   if (!raw) return ""
   var d = new Date(raw)
   if (isNaN(d.getTime())) return ""

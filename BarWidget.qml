@@ -24,20 +24,14 @@ BarWidget {
 
   property var digest: Model.EMPTY
   property var pulse: Model.EMPTY_PULSE
-  property var readIds: []
-  property var pulseSeen: []
-  property string readAt: ""
+  property var read: Model.EMPTY_READ
 
-  // Unread means two different things that add up to one number: a digest the
-  // reader has not cleared yet, plus anything that landed since it was built.
-  readonly property int unreadDigest: {
-    if (!digest.generatedAt) return 0
-    if (readAt && readAt >= digest.generatedAt) return 0
-    return (digest.items || []).length
-  }
-  // Counts only the rows the reader has not cleared, so dismissing the overlay
-  // — which shows those same rows — actually empties the badge.
-  readonly property int sinceDigest: Model.unseenPulseCount(pulse, pulseSeen)
+  // Unread means two things that add up to one number: the digest rows the
+  // reader has not cleared, plus anything that landed after it was built. Both
+  // halves are counted the same way the overlay filters them, so the badge is
+  // the length of the list the dialog opens on -- never a different number.
+  readonly property int unreadDigest: Model.unreadItems(digest, read).length
+  readonly property int sinceDigest: Model.unseenPulseCount(pulse, read.pulseSeen)
   readonly property int count: unreadDigest + sinceDigest
   readonly property bool stale: pulse.health === "stale"
 
@@ -82,19 +76,9 @@ BarWidget {
     path: root.home + "/.local/state/omarchy-wiki-digest/read.json"
     watchChanges: true
     printErrors: false
-    onLoaded: {
-      root.pulseSeen = Model.parsePulseSeen(text())
-      try {
-        root.readAt = JSON.parse(text()).readAt || ""
-      } catch (e) {
-        root.readAt = ""
-      }
-    }
+    onLoaded: root.read = Model.parseRead(text())
     onFileChanged: reload()
-    onLoadFailed: {
-      root.readAt = ""
-      root.pulseSeen = []
-    }
+    onLoadFailed: root.read = Model.EMPTY_READ
   }
 
   WidgetButton {

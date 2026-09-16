@@ -28,30 +28,38 @@ Item {
   readonly property color accent: Color.accent
   readonly property var borderSpec: Border.surfaceSpec("menu", "border", Color.menu.border, Math.max(1, Style.space(2)))
 
-  // Two digests are held at once: today's, and whatever it replaced. The view
-  // is derived rather than swapped in place, so going back and forth cannot
-  // desynchronise the header, the list and the counter.
-  property var current: Model.EMPTY
-  property var previous: null
-  property bool showingPrevious: false
-  readonly property bool hasPrevious: previous !== null
-                                      && ((previous.generatedAt || "") !== "")
-                                      && (previous.generatedAt !== (current.generatedAt || ""))
-  readonly property var digest: (showingPrevious && hasPrevious) ? previous : current
-  readonly property var items: Model.sorted(digest.items)
-
-  // Whatever the badge counted after this digest was built. Held apart from
-  // `items` because it is a different kind of row -- fetched, not summarised --
-  // and because the archive must never mix today's live pulse into a digest
-  // from another day.
+  // One digest, two ways of reading it. Unread is what the overlay opens on --
+  // an inbox, so the door you come in through never shows you the same change
+  // twice. Everything is the briefing itself: the whole window the 09:00 run
+  // covered, re-readable all day however much of it you have already cleared.
+  property var digest: Model.EMPTY
+  property var read: Model.EMPTY_READ
   property var pulse: Model.EMPTY_PULSE
-  property var pulseSeen: []
-  readonly property var fresh: root.showingPrevious
-                               ? []
-                               : Model.unseenPulse(root.pulse, root.pulseSeen)
-  // One list for everything the reader can select, open or count, so the
-  // keyboard and the numeral cannot disagree with what is on screen.
-  readonly property var rows: root.items.concat(root.fresh)
+  property bool showingAll: false
+
+  // Both halves of the window. The digest is the summarised part; the pulse
+  // rows are what landed after it was built, which belongs to the same day
+  // even though no model has read them.
+  readonly property var digestItems: Model.sorted(digest.items)
+  readonly property var pulseItems: root.pulse.items || []
+  readonly property var unreadDigest: Model.sorted(Model.unreadItems(root.digest, root.read))
+  readonly property var unreadPulse: Model.unseenPulse(root.pulse, root.read.pulseSeen)
+
+  // The list the whole view derives from -- the numeral, the keyboard, the
+  // cards and the empty state all read this one property, so they cannot
+  // disagree about what is on screen.
+  readonly property var rows: root.showingAll
+                              ? root.digestItems.concat(root.pulseItems)
+                              : root.unreadDigest.concat(root.unreadPulse)
+  // Where the "Since this morning" divider goes: after the summarised rows.
+  readonly property int freshFrom: root.showingAll
+                                   ? root.digestItems.length
+                                   : root.unreadDigest.length
+  // Nothing left to read, but the day was not empty -- the one state that has
+  // somewhere else to point.
+  readonly property bool caughtUp: !root.showingAll
+                                   && root.rows.length === 0
+                                   && root.digestItems.length + root.pulseItems.length > 0
   property string emptyArt: ""
 
   // The illustration ships as a plain SVG with colour placeholders. Qt's SVG
@@ -82,12 +90,11 @@ Item {
 
   function open(payloadJson) {
     digestFile.reload()
-    previousFile.reload()
     pulseFile.reload()
     readFile.reload()
-    // Always opens on today's digest; the archive is somewhere you go, not a
-    // state you can get stuck in.
-    root.showingPrevious = false
+    // Always opens on the unread view; the full briefing is somewhere you go,
+    // not a state you can get stuck in.
+    root.showingAll = false
     root.opened = true
     root.restage()
     root.selectedIndex = -1
@@ -146,12 +153,7 @@ Item {
   }
 
   function reload(raw) {
-    root.current = Model.parse(raw)
-  }
-
-  function reloadPrevious(raw) {
-    var parsed = Model.parse(raw)
-    root.previous = (parsed.generatedAt || "") !== "" ? parsed : null
+    root.digest = Model.parse(raw)
   }
 
   // Cards animate in on reveal, so a digest swap has to drop and retake the
@@ -170,9 +172,8 @@ Item {
     restager.restart()
   }
 
-  function togglePrevious() {
-    if (!root.hasPrevious) return
-    root.showingPrevious = !root.showingPrevious
+  function toggleAll() {
+    root.showingAll = !root.showingAll
     root.selectedIndex = -1
     root.counter = 0
     if (root.animate) counterAnim.restart()
@@ -193,16 +194,6 @@ Item {
   }
 
   FileView {
-    id: previousFile
-    path: root.dataDir + "/digest.prev.json"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.reloadPrevious(text())
-    onFileChanged: reload()
-    onLoadFailed: root.previous = null
-  }
-
-  FileView {
     id: pulseFile
     path: root.dataDir + "/pulse.json"
     watchChanges: true
@@ -212,16 +203,16 @@ Item {
     onLoadFailed: root.pulse = Model.EMPTY_PULSE
   }
 
-  // Read for `pulseSeen` only; the digest's own read state belongs to the bar
-  // widget, which is the surface that has to show a count.
+  // What separates the two views: without this everything is unread, which is
+  // the safe direction to fail in.
   FileView {
     id: readFile
     path: root.home + "/.local/state/omarchy-wiki-digest/read.json"
     watchChanges: true
     printErrors: false
-    onLoaded: root.pulseSeen = Model.parsePulseSeen(text())
+    onLoaded: root.read = Model.parseRead(text())
     onFileChanged: reload()
-    onLoadFailed: root.pulseSeen = []
+    onLoadFailed: root.read = Model.EMPTY_READ
   }
 
   FileView {
@@ -332,7 +323,7 @@ Item {
             } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
               root.move(-1)
             } else if (event.key === Qt.Key_P) {
-              root.togglePrevious()
+              root.toggleAll()
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               root.openItem(root.selectedIndex < 0 ? 0 : root.selectedIndex)
             } else {
@@ -378,17 +369,18 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
 
                   Text {
-                    text: Model.headlineFor(root.digest, root.language, root.fresh.length)
+                    text: Model.headlineFor(root.digest, root.language, root.rows.length)
                     color: root.foreground
                     font.family: Style.font.menuFamily
                     font.pixelSize: Style.font.heading
                     font.bold: true
                   }
 
+                  // Only the full view names its window. The unread list is
+                  // "what is left", which no start date describes.
                   Text {
-                    visible: root.showingPrevious
-                    text: (root.language === "nl" ? "vorige overzicht · " : "previous digest · ")
-                          + Model.digestDate(root.digest, root.language)
+                    visible: root.showingAll && text !== ""
+                    text: Model.coverageFor(root.digest, root.language)
                     color: root.accent
                     opacity: 0.9
                     font.family: Style.font.menuFamily
@@ -397,7 +389,7 @@ Item {
 
                   Text {
                     text: Model.subtitleFor(root.digest, root.language)
-                    visible: text !== "" && root.items.length > 0
+                    visible: text !== "" && root.showingAll && root.rows.length > 0
                     color: root.foreground
                     opacity: 0.6
                     font.family: Style.font.menuFamily
@@ -424,7 +416,9 @@ Item {
           Text {
             width: parent.width
             visible: text !== ""
-            text: root.items.length > 0 ? (root.digest.tldr || "") : ""
+            // The tl;dr summarises the whole digest, so it belongs to the
+            // view that shows the whole digest.
+            text: root.showingAll && root.rows.length > 0 ? (root.digest.tldr || "") : ""
             color: root.foreground
             opacity: root.opened ? 0.92 : 0
             wrapMode: Text.WordWrap
@@ -488,6 +482,20 @@ Item {
                 horizontalAlignment: Text.AlignHCenter
                 anchors.horizontalCenter: parent.horizontalCenter
               }
+
+              // An inbox empty because you read it, and one empty because
+              // nothing happened, look identical -- and only the first has
+              // somewhere to send you.
+              Text {
+                visible: root.caughtUp
+                text: Model.caughtUpHint(root.language)
+                color: root.accent
+                opacity: 0.7
+                font.family: Style.font.menuFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+                anchors.horizontalCenter: parent.horizontalCenter
+              }
             }
           }
 
@@ -530,8 +538,9 @@ Item {
                   required property int index
                   required property var modelData
 
-                  readonly property bool startsFresh: root.fresh.length > 0
-                                                      && index === root.items.length
+                  // index is always a valid row here, so reaching freshFrom
+                  // means there is at least one unsummarised row to head.
+                  readonly property bool startsFresh: index === root.freshFrom
 
                   width: itemColumn.width
                   spacing: Style.space(8)
@@ -619,7 +628,7 @@ Item {
             text: {
               var nl = root.language === "nl"
               var base = nl ? "↑↓ kiezen · ⏎ openen" : "↑↓ select · ⏎ open"
-              return root.hasPrevious ? base + (nl ? " · p vorige" : " · p previous") : base
+              return base + " · " + Model.modeHint(root.showingAll, root.language)
             }
             color: root.foreground
             opacity: 0.45
@@ -627,14 +636,11 @@ Item {
             font.pixelSize: Style.font.caption
           }
 
-          // One button, not a pager: there is exactly one previous digest on
-          // disk, so this is somewhere to look back at, not a history to walk.
+          // Always offered, even on a day with nothing unread -- that is
+          // exactly when you want to see what the briefing said.
           Button {
-            visible: root.hasPrevious
-            text: root.showingPrevious
-                  ? (root.language === "nl" ? "Terug naar vandaag" : "Back to today")
-                  : (root.language === "nl" ? "Vorige" : "Previous")
-            onClicked: root.togglePrevious()
+            text: Model.modeLabel(root.showingAll, root.language)
+            onClicked: root.toggleAll()
           }
 
           Button {
@@ -653,9 +659,9 @@ Item {
     function show(): void { root.open("{}") }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): void { digestFile.reload(); previousFile.reload(); pulseFile.reload(); readFile.reload() }
-    // Lets a keybinding drop straight into the archive, and makes the toggle
-    // testable without synthesising a keypress.
-    function previous(): void { root.togglePrevious() }
+    function refresh(): void { digestFile.reload(); pulseFile.reload(); readFile.reload() }
+    // Lets a keybinding drop straight into the full briefing, and makes the
+    // toggle testable without synthesising a keypress.
+    function everything(): void { root.toggleAll() }
   }
 }

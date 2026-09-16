@@ -16,10 +16,11 @@ Pick a key that is actually free on your machine — `hyprctl binds -j` lists
 what is taken. Then set `shortcut` in the widget's layout entry to the same
 keys so the tooltip advertises it; that field is display text only.
 
-To land straight in the previous digest instead:
+To land straight in the full briefing — everything since the last run, read or
+not — instead of the unread list:
 
 ```lua
-o.bind("SUPER + SHIFT + D", "Previous wiki digest", "omarchy-shell jevido.wiki previous")
+o.bind("SUPER + SHIFT + D", "Full wiki digest", "omarchy-shell jevido.wiki everything")
 ```
 
 ## Stop the compositor fading the overlay

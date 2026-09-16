@@ -151,20 +151,31 @@ On a quiet day the digest shows an illustration rather than a blank panel.
 `{{dim}}` placeholders, substituted at load, so swapping the art for your own
 is editing one file.
 
-## Looking back
+## Two views
 
-Each run keeps the digest it replaced, so the overlay has a **Previous** button
-(and `p`) that swaps to the last one — typically yesterday's 09:00. The header
-then says which digest you are reading and the button becomes **Back to today**.
+The overlay opens on what you have **not read yet** — the digest rows you never
+cleared, plus anything the pulse found afterwards. Read it, dismiss it, open it
+again an hour later and you get what arrived in that hour, not the same seven
+pages a second time.
 
-It is one button, not a pager: exactly one previous digest is kept on disk, so
-this is somewhere to glance back at, not an archive to walk. Opening the
-overlay always lands on today.
+**Everything** (and `p`) is the briefing itself: the whole window the morning
+run covered, read or not, summary and all. That is where you go when you
+cleared the digest at 09:02 and want to know at four o'clock what the day
+actually said. The header names the window it covers — watermark-based, so
+after a week away it says last Tuesday rather than pretending it is always a
+day.
+
+An inbox that is empty because you read it looks exactly like one that is empty
+because nothing happened, so the first says where the day went.
+
+Each run still keeps the digest it replaced as `digest.prev.json`, which is
+worth having when a summary reads wrong — but nothing in the overlay opens it.
 
 ## Keys
 
-`↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `p` for the previous
-digest, `Esc` or **Got it** to dismiss. Clicking outside does *not* dismiss —
-clearing the morning briefing should take a real action.
+`↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `p` to switch
+between unread and everything, `Esc` or **Got it** to dismiss. Clicking outside
+does *not* dismiss — clearing the morning briefing should take a real action.
 
-Scriptable too: `omarchy-shell jevido.wiki previous` opens straight into it.
+Scriptable too: `omarchy-shell jevido.wiki everything` opens straight into the
+full briefing.
