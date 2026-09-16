@@ -16,6 +16,10 @@ Pick a key that is actually free on your machine — `hyprctl binds -j` lists
 what is taken. Then set `shortcut` in the widget's layout entry to the same
 keys so the tooltip advertises it; that field is display text only.
 
+`SUPER + D` is worth the collision check: the overlay takes plain `d` to switch
+between unread and the full briefing, so one finger opens it, switches view,
+and closes it again.
+
 To land straight in the full briefing — everything since the last run, read or
 not — instead of the unread list:
 

@@ -117,15 +117,15 @@ function modeLabel(showingAll, language) {
 
 function modeHint(showingAll, language) {
   var nl = language === "nl"
-  if (showingAll) return nl ? "p ongelezen" : "p unread"
-  return nl ? "p alles" : "p everything"
+  if (showingAll) return nl ? "d ongelezen" : "d unread"
+  return nl ? "d alles" : "d everything"
 }
 
 // Points at the other view rather than just stating the obvious: an inbox that
 // is empty because you read it has nowhere else to say where the day went.
 function caughtUpHint(language) {
-  return language === "nl" ? "p toont het volledige overzicht"
-                           : "p shows the full digest"
+  return language === "nl" ? "d toont het volledige overzicht"
+                           : "d shows the full digest"
 }
 
 // Says why these rows read differently from the ones above them, so a missing

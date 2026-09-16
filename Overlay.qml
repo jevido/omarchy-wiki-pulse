@@ -322,7 +322,7 @@ Item {
               root.move(1)
             } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
               root.move(-1)
-            } else if (event.key === Qt.Key_P) {
+            } else if (event.key === Qt.Key_D) {
               root.toggleAll()
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               root.openItem(root.selectedIndex < 0 ? 0 : root.selectedIndex)

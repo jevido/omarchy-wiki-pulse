@@ -158,7 +158,7 @@ cleared, plus anything the pulse found afterwards. Read it, dismiss it, open it
 again an hour later and you get what arrived in that hour, not the same seven
 pages a second time.
 
-**Everything** (and `p`) is the briefing itself: the whole window the morning
+**Everything** (and `d`) is the briefing itself: the whole window the morning
 run covered, read or not, summary and all. That is where you go when you
 cleared the digest at 09:02 and want to know at four o'clock what the day
 actually said. The header names the window it covers — watermark-based, so
@@ -173,9 +173,13 @@ worth having when a summary reads wrong — but nothing in the overlay opens it.
 
 ## Keys
 
-`↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `p` to switch
+`↑`/`↓` or `j`/`k` to move, `Enter` to open in the browser, `d` to switch
 between unread and everything, `Esc` or **Got it** to dismiss. Clicking outside
 does *not* dismiss — clearing the morning briefing should take a real action.
+
+`d` pairs with whatever you bound to open the overlay: bind `SUPER + D` and the
+same finger opens it, switches view, and — because the compositor's binding
+wins over the overlay's keyboard grab — `SUPER + D` again closes it.
 
 Scriptable too: `omarchy-shell jevido.wiki everything` opens straight into the
 full briefing.
