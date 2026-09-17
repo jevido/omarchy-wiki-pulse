@@ -152,6 +152,20 @@ Item {
     Quickshell.execDetached(["omarchy-wiki-digest", "mark-read"])
   }
 
+  // One row, rather than the whole briefing: the way you clear the two things
+  // you have dealt with and leave the rest for after lunch.
+  function markItem(index) {
+    if (index < 0 || index >= root.rows.length) return
+    var id = root.rows[index].id
+    if (!id) return
+    Quickshell.execDetached(["omarchy-wiki-digest", "mark-read", "--item", id])
+    // In the unread view the row is about to disappear from under the cursor.
+    // Staying at this index lands on whatever followed it, which is where the
+    // eye already is; falling to the end of a shorter list would not be.
+    if (!root.showingAll)
+      root.selectedIndex = Math.min(index, root.rows.length - 2)
+  }
+
   function openItem(index) {
     if (index < 0 || index >= root.rows.length) return
     var url = root.rows[index].url
@@ -347,6 +361,8 @@ Item {
               root.move(-1)
             } else if (event.key === Qt.Key_D) {
               root.toggleAll()
+            } else if (event.key === Qt.Key_G) {
+              root.markItem(root.selectedIndex < 0 ? 0 : root.selectedIndex)
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               root.openItem(root.selectedIndex < 0 ? 0 : root.selectedIndex)
             } else {
@@ -685,7 +701,8 @@ Item {
             text: {
               var nl = root.language === "nl"
               var base = nl ? "↑↓ kiezen · ⏎ openen" : "↑↓ select · ⏎ open"
-              return base + " · " + Model.modeHint(root.showingAll, root.language)
+              return base + " · " + Model.markHint(root.language)
+                          + " · " + Model.modeHint(root.showingAll, root.language)
             }
             color: root.foreground
             opacity: 0.45

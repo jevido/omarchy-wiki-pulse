@@ -1747,27 +1747,63 @@ def pulse_key(item) -> str:
     return f"{item.get('id', '')}@{item.get('updatedAt', '')}"
 
 
-def cmd_mark_read(_args) -> int:
-    """Record that the digest on screen has been seen.
+def cmd_mark_read(args) -> int:
+    """Record that what is on screen has been seen.
 
-    The overlay calls this on dismiss rather than writing the file itself, so
-    there stays exactly one writer per file in the state directory.
+    The overlay calls this rather than writing the file itself, so there stays
+    exactly one writer per file in the state directory.
 
-    The pulse rows are cleared here too: the overlay shows them alongside the
-    digest, so dismissing it has seen them, and a badge that kept counting
+    With no `--item` this clears the whole briefing — what dismissing the
+    overlay does. The pulse rows go with it: the overlay shows them alongside
+    the digest, so dismissing it has seen them, and a badge that kept counting
     what is already on screen would never reach zero.
+
+    With `--item` only those rows are cleared, merged into whatever was cleared
+    before, so marking rows off one at a time and then dismissing the rest do
+    not fight over the file.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     digest = load_json(DIGEST_PATH, {})
     pulse = load_json(PULSE_PATH, {})
+    generated = digest.get("generatedAt", "")
+    wanted = list(getattr(args, "item", None) or [])
+    pulse_items = pulse.get("items") or []
+
+    if not wanted:
+        ids = [item.get("id") for item in (digest.get("items") or [])]
+        pulse_seen = [pulse_key(item) for item in pulse_items]
+    else:
+        prior = load_json(READ_PATH, {})
+        # A record written against an older digest describes rows that are no
+        # longer on screen, so it is started over rather than merged into --
+        # the same rule unreadItems() applies when it reads the file back.
+        if prior.get("digestGeneratedAt") != generated:
+            prior = {}
+        ids = list(prior.get("ids") or [])
+        pulse_seen = list(prior.get("pulseSeen") or [])
+        known = {item.get("id") for item in (digest.get("items") or [])}
+        for ident in wanted:
+            if ident in known and ident not in ids:
+                ids.append(ident)
+            # A page or ticket can be in both halves at once. Only the pulse
+            # revision currently listed is cleared, so one touched again after
+            # this comes back -- which is the whole reason the key carries a
+            # timestamp.
+            for item in pulse_items:
+                if item.get("id") != ident:
+                    continue
+                key = pulse_key(item)
+                if key not in pulse_seen:
+                    pulse_seen.append(key)
+
     write_json_atomic(
         READ_PATH,
         {
             "schemaVersion": SCHEMA_VERSION,
             "readAt": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "digestGeneratedAt": digest.get("generatedAt", ""),
-            "ids": [item.get("id") for item in (digest.get("items") or [])],
-            "pulseSeen": [pulse_key(item) for item in (pulse.get("items") or [])],
+            "digestGeneratedAt": generated,
+            "ids": ids,
+            "pulseSeen": pulse_seen,
         },
         0o644,
     )
@@ -1821,6 +1857,12 @@ def main() -> int:
     pulse.set_defaults(func=cmd_pulse)
 
     mark = sub.add_parser("mark-read", help="clear the badge for the current digest")
+    mark.add_argument(
+        "--item",
+        action="append",
+        metavar="ID",
+        help="clear only this row, merging into what was already cleared; repeatable",
+    )
     mark.set_defaults(func=cmd_mark_read)
 
     status = sub.add_parser("status", help="show cursor and last run")

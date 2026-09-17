@@ -146,6 +146,13 @@ function modeLabel(showingAll, language) {
   return nl ? "Alles" : "Everything"
 }
 
+// Worth naming in the footer: clearing one row is the only thing here that
+// changes state, and nothing on screen suggests a single row can be dealt with
+// on its own.
+function markHint(language) {
+  return language === "nl" ? "g gezien" : "g seen"
+}
+
 function modeHint(showingAll, language) {
   var nl = language === "nl"
   if (showingAll) return nl ? "d ongelezen" : "d unread"
