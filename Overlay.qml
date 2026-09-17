@@ -123,6 +123,13 @@ Item {
   // has to find that one rather than whichever was built first.
   signal grabRequested()
 
+  // Scrolling the list has to be asked for the same way, and for the same
+  // reason: the Flickable lives inside the per-monitor delegate, and an id
+  // declared in there is not visible out here. Reaching for it directly throws
+  // -- which is exactly what selection-follows-keyboard did, silently, on
+  // every arrow press. A signal crosses the boundary; an id does not.
+  signal revealRequested(int index)
+
   function grabKeyboard() {
     root.grabRequested()
   }
@@ -159,7 +166,7 @@ Item {
     if (next < 0) next = 0
     if (next >= root.rows.length) next = root.rows.length - 1
     root.selectedIndex = next
-    scroller.ensureVisible(next)
+    root.revealRequested(next)
   }
 
   function reload(raw) {
@@ -174,7 +181,13 @@ Item {
   Timer {
     id: restager
     interval: 16
-    onTriggered: root.revealItems = true
+    onTriggered: {
+      root.revealItems = true
+      // A new list starts at the top. Without this, switching views keeps the
+      // old scroll offset and drops you into the middle of a list you have not
+      // read a word of.
+      root.revealRequested(0)
+    }
   }
 
   function restage() {
@@ -510,6 +523,24 @@ Item {
           }
 
           // ---- items --------------------------------------------------------
+          NumberAnimation {
+            id: scrollTo
+            target: scroller
+            property: "contentY"
+            duration: 200
+            easing.type: Easing.OutCubic
+          }
+
+          // Inside the delegate, where `scroller` is actually in scope. Every
+          // monitor's copy scrolls, so the digest on the second screen does not
+          // sit on a viewport the keyboard has long since left behind.
+          Connections {
+            target: root
+            function onRevealRequested(index) {
+              scroller.ensureVisible(index)
+            }
+          }
+
           Flickable {
             id: scroller
             width: parent.width
@@ -522,13 +553,27 @@ Item {
             clip: true
             boundsBehavior: Flickable.StopAtBounds
 
+            // Keeps the selected row on screen, and keeps it *readable*: a
+            // row's worth of margin either side, so the selection never sits
+            // flush against the fold with its next line hidden. Animated,
+            // because a list that teleports makes you re-find your place --
+            // the point of arrowing down is that the eye can follow.
             function ensureVisible(index) {
               if (index < 0 || index >= itemRepeater.count) return
               var entry = itemRepeater.itemAt(index)
               if (!entry) return
-              if (entry.y < contentY) contentY = entry.y
-              else if (entry.y + entry.height > contentY + height)
-                contentY = entry.y + entry.height - height
+              var pad = Style.space(28)
+              var target = contentY
+              if (entry.y - pad < contentY)
+                target = entry.y - pad
+              else if (entry.y + entry.height + pad > contentY + height)
+                target = entry.y + entry.height + pad - height
+              // Clamped here rather than left to the Flickable: an unclamped
+              // target animates past the end and snaps back.
+              target = Math.max(0, Math.min(target, Math.max(0, contentHeight - height)))
+              if (Math.abs(target - contentY) < 1) return
+              scrollTo.to = target
+              scrollTo.restart()
             }
 
             Column {
