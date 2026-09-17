@@ -4,7 +4,7 @@
   "name": "Wiki Pulse",
   "version": "1.0.0",
   "author": "Jeffrey Duivenvoorden",
-  "description": "A daily digest of what your colleagues wrote on the wiki and moved in Jira — fullscreen each morning, a silent badge the rest of the day",
+  "description": "A daily digest of what your colleagues wrote on the wiki and moved in Jira \u2014 fullscreen each morning, a silent badge the rest of the day",
   "kinds": [
     "bar-widget",
     "overlay"
@@ -21,9 +21,10 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "glyph": "󰂺",
+      "glyph": "\udb80\udcba",
       "hideWhenEmpty": false,
-      "shortcut": "Super+D"
+      "shortcut": "Super+D",
+      "sourceFilter": "both"
     },
     "schema": [
       {
@@ -40,6 +41,11 @@
         "key": "shortcut",
         "type": "string",
         "label": "Shortcut shown in the tooltip"
+      },
+      {
+        "key": "sourceFilter",
+        "type": "string",
+        "label": "Which sources the digest opens on (both, jira, wiki)"
       }
     ]
   }

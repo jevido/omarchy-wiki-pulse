@@ -21,6 +21,11 @@ BarWidget {
   // been dismissed, so a widget that disappears on a quiet day takes the door
   // with it. Opt in if you would rather reclaim the bar space.
   readonly property bool hideWhenEmpty: setting("hideWhenEmpty", false)
+  // Which sources the overlay opens on. Stored here rather than in the
+  // overlay because it is a preference, not a view state: the overlay's own
+  // `s` still switches freely once you are in there.
+  readonly property string sourceFilter: Model.normalisedSourceView(setting("sourceFilter", "both"))
+  property bool settingsOpen: false
 
   property var digest: Model.EMPTY
   property var pulse: Model.EMPTY_PULSE
@@ -47,7 +52,23 @@ BarWidget {
 
   function openDigest() {
     if (root.bar && root.bar.shell && typeof root.bar.shell.summon === "function")
-      root.bar.shell.summon("jevido.wiki", "{}")
+      root.bar.shell.summon("jevido.wiki", JSON.stringify({ source: root.sourceFilter }))
+  }
+
+  // Applied locally first so the popup redraws on the click itself; the
+  // shell.json write comes back through the bar as the same value. With no
+  // writable entry it stays a session preference rather than doing nothing.
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var key in values) entry[key] = values[key]
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function runDigest() {
+    Quickshell.execDetached(["omarchy-wiki-digest", "run", "--force", "--no-show"])
   }
 
   FileView {
@@ -108,9 +129,153 @@ BarWidget {
     }
 
     onPressed: function (b) {
-      if (b === Qt.RightButton) root.refresh()
+      // Right click used to reload the three files behind the badge, which is
+      // something you would only ever do while suspecting a bug. The settings
+      // are what someone actually reaches for, and the reload is a button in
+      // there.
+      if (b === Qt.RightButton) root.settingsOpen = !root.settingsOpen
       else if (b === Qt.MiddleButton) Quickshell.execDetached(["omarchy-wiki-pulse"])
       else root.openDigest()
+    }
+  }
+
+  PopupCard {
+    id: settingsPopup
+    anchorItem: root
+    bar: root.bar
+    owner: root
+    open: root.settingsOpen
+    contentWidth: settingsPopup.fittedContentWidth(Style.space(340))
+    contentHeight: settingsPopup.fittedContentHeight(settingsColumn.implicitHeight)
+
+    readonly property color ink: Color.popups.text
+
+    Column {
+      id: settingsColumn
+      anchors.fill: parent
+      spacing: Style.space(12)
+
+      Text {
+        text: qsTr("OPENS ON")
+        color: Qt.darker(settingsPopup.ink, 1.5)
+        font.family: Style.font.menuFamily
+        font.pixelSize: Style.font.bodySmall
+        font.letterSpacing: 1
+      }
+
+      ButtonGroup {
+        width: parent.width
+        options: [
+          { value: "both", label: qsTr("Both") },
+          { value: "jira", label: "Jira" },
+          { value: "wiki", label: qsTr("Wiki") }
+        ]
+        value: root.sourceFilter
+        foreground: settingsPopup.ink
+        fontFamily: Style.font.menuFamily
+        onChanged: function (value) { root.persistSettings({ sourceFilter: value }) }
+      }
+
+      Text {
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: qsTr("Which sources the digest opens on. `s` cycles them once you are in it.")
+        color: Qt.darker(settingsPopup.ink, 2.0)
+        font.family: Style.font.menuFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        text: qsTr("BAR")
+        color: Qt.darker(settingsPopup.ink, 1.5)
+        font.family: Style.font.menuFamily
+        font.pixelSize: Style.font.bodySmall
+        font.letterSpacing: 1
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+
+        TextField {
+          id: glyphField
+          width: parent.width - glyphApply.width - Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.glyph
+          placeholderText: "󰂺"
+          foreground: settingsPopup.ink
+          font.family: Style.font.menuFamily
+          Keys.onPressed: function (event) {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              root.persistSettings({ glyph: glyphField.text })
+              event.accepted = true
+            } else if (event.key === Qt.Key_Escape) {
+              glyphField.text = root.glyph
+              event.accepted = true
+            }
+          }
+        }
+
+        Button {
+          id: glyphApply
+          anchors.verticalCenter: parent.verticalCenter
+          text: qsTr("Apply")
+          bordered: true
+          foreground: settingsPopup.ink
+          fontFamily: Style.font.menuFamily
+          onClicked: root.persistSettings({ glyph: glyphField.text })
+        }
+      }
+
+      Toggle {
+        width: parent.width
+        label: qsTr("Hide when there is nothing new")
+        description: qsTr("Off by default: this is the only way back into today\u2019s digest")
+        checked: root.hideWhenEmpty
+        foreground: settingsPopup.ink
+        fontFamily: Style.font.menuFamily
+        onClicked: root.persistSettings({ hideWhenEmpty: !root.hideWhenEmpty })
+      }
+
+      Text {
+        text: qsTr("ACTIONS")
+        color: Qt.darker(settingsPopup.ink, 1.5)
+        font.family: Style.font.menuFamily
+        font.pixelSize: Style.font.bodySmall
+        font.letterSpacing: 1
+      }
+
+      Button {
+        width: parent.width
+        text: qsTr("Refresh the count now")
+        bordered: true
+        leftAlign: true
+        foreground: settingsPopup.ink
+        fontFamily: Style.font.menuFamily
+        onClicked: Quickshell.execDetached(["omarchy-wiki-pulse"])
+      }
+
+      Button {
+        width: parent.width
+        text: qsTr("Rebuild the digest")
+        bordered: true
+        leftAlign: true
+        foreground: settingsPopup.ink
+        fontFamily: Style.font.menuFamily
+        onClicked: root.runDigest()
+      }
+
+      // Tokens, JQL and persona stay in the file. They are secrets and
+      // long-lived choices, and a popup that can be summoned over a shared
+      // screen is the wrong place to keep either readable.
+      Text {
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: qsTr("Tokens, JQL and persona live in ~/.config/omarchy/wiki-digest.json")
+        color: Qt.darker(settingsPopup.ink, 2.0)
+        font.family: Style.font.menuFamily
+        font.pixelSize: Style.font.caption
+      }
     }
   }
 }
