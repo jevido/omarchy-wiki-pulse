@@ -20,6 +20,7 @@ Item {
   signal hovered()
 
   readonly property bool urgent: entry.suggestedAction === "blocked-on-me"
+  readonly property bool fromJira: Model.sourceOf(card.entry) === "jira"
   readonly property color accent: urgent ? Color.accent : Color.menu.text
   readonly property color surface: card.selected ? Color.menu.selectedBackground : "transparent"
 
@@ -92,6 +93,32 @@ Item {
       spacing: Style.space(8)
       width: parent.width
 
+      // Which system this came from, said in a word rather than implied by a
+      // ticket key the eye has to parse first. Both chips are drawn the same
+      // way on purpose: the accent means "this is waiting on you" everywhere
+      // else on the card, and colouring one source with it would promise
+      // urgency that a source does not carry.
+      Rectangle {
+        id: sourceChip
+        implicitWidth: chipLabel.implicitWidth + Style.space(12)
+        implicitHeight: chipLabel.implicitHeight + Style.space(5)
+        radius: Style.space(4)
+        color: Qt.rgba(Color.menu.text.r, Color.menu.text.g, Color.menu.text.b,
+                       card.fromJira ? 0.14 : 0.07)
+        anchors.verticalCenter: parent.verticalCenter
+
+        Text {
+          id: chipLabel
+          anchors.centerIn: parent
+          text: Model.sourceLabel(card.entry.source)
+          color: Color.menu.text
+          opacity: card.fromJira ? 0.8 : 0.5
+          font.family: Style.font.menuFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+
       Text {
         text: Model.actionGlyph(card.entry.suggestedAction)
         visible: text !== ""
@@ -109,7 +136,7 @@ Item {
         font.pixelSize: Style.font.title
         font.bold: card.entry.priority === "high"
         elide: Text.ElideRight
-        width: Math.min(implicitWidth, parent.width - Style.space(180))
+        width: Math.min(implicitWidth, parent.width - sourceChip.width - Style.space(190))
         anchors.verticalCenter: parent.verticalCenter
       }
 

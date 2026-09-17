@@ -117,16 +117,24 @@ function bySource(items, source) {
   return (items || []).filter(function (item) { return sourceOf(item) === source })
 }
 
+// The word on the card's chip. Deliberately the product name rather than
+// something descriptive: "JIRA" is what you would say out loud, and the chip
+// has to be readable at a glance from across the row.
+function sourceLabel(source) {
+  return sourceOf({ source: source }) === "jira" ? "JIRA" : "WIKI"
+}
+
 // The section headings, keyed by the row index they sit above.
 //
-// The two sources only get named when both are on screen: a heading that never
-// has a sibling is decoration, and this surface has no room for decoration. The
-// "since this morning" divider is a time boundary, not a source one, so it is
-// always drawn when there is a tail to head.
+// Named as soon as tickets are in play, including on a day that is nothing but
+// tickets — being told which system you are reading is worth a line even when
+// there is only one. A wiki-only day needs no heading: that is what this
+// surface has always been. The "since this morning" divider is a time
+// boundary, not a source one, so it is drawn whenever there is a tail to head.
 function headings(wikiCount, jiraCount, freshCount, language) {
   var map = {}
-  if (wikiCount > 0 && jiraCount > 0) {
-    map[0] = { title: "Wiki", note: "" }
+  if (jiraCount > 0) {
+    if (wikiCount > 0) map[0] = { title: "Wiki", note: "" }
     map[wikiCount] = { title: "Jira", note: "" }
   }
   if (freshCount > 0) {
