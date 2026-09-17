@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Daily Outline wiki digest for the Omarchy bar.
+"""Daily Outline wiki and Jira digest for the Omarchy bar.
 
 Fetches documents changed since the last digest, diffs them against the text as
-it stood when the user last saw it, has Claude summarise and rank the result,
+it stood when the user last saw it, collects the Jira tickets colleagues moved
+or commented on in the same window, has Claude summarise and rank the result,
 and writes one atomic JSON file the Quickshell plugin renders.
+
+The two sources are independent: each carries its own watermark, and a Jira
+outage costs you the Jira half of the briefing rather than the whole of it.
 
 The design rule throughout: the watermark, the baselines and the daily stamp
 commit together or not at all. Any failure leaves the cursor untouched, so the
@@ -13,6 +17,7 @@ next retry sees the identical change set rather than silently losing a day.
 from __future__ import annotations
 
 import argparse
+import base64
 import difflib
 import fcntl
 import hashlib
@@ -49,8 +54,9 @@ PULSE_PATH = DATA_DIR / "pulse.json"
 SCHEMA_VERSION = 1
 
 # The badge may promise only as much as the overlay can show, so pulse carries
-# its own items. Capped: this is the "something landed" list, not a second
-# digest, and an unbounded one would turn a quiet surface into a feed.
+# its own items. Capped per source: this is the "something landed" list, not a
+# second digest, and an unbounded one would turn a quiet surface into a feed.
+# Per source rather than overall so a busy wiki cannot hide every ticket.
 PULSE_MAX_ITEMS = 20
 
 DEFAULTS = {
@@ -71,6 +77,24 @@ DEFAULTS = {
     "payloadCharBudget": 140000,
     "baselineRetentionDays": 90,
     "notifyAfterFailures": 3,
+    # Absent or without a baseUrl means "no Jira", and nothing in the pipeline
+    # so much as resolves a token.
+    "jira": {},
+}
+
+JIRA_DEFAULTS = {
+    "baseUrl": "",
+    # A scoped API token is only accepted through the api.atlassian.com
+    # gateway, which addresses the site by id rather than by hostname. Left
+    # empty it is resolved from the site itself and cached, so the config only
+    # needs it when this machine cannot reach `_edge/tenant_info`.
+    "cloudId": "",
+    "email": "",
+    "tokenCommand": "",
+    "jql": "",
+    "maxItems": 25,
+    "includeOwnChanges": False,
+    "bootstrapDays": 7,
 }
 
 # Documents whose text is shorter than this are treated as structural stubs
@@ -143,6 +167,12 @@ expliciet iets vraagt.
 `tldr` is één alinea van hoogstens vijf zinnen die de twee of drie draden benoemt die \
 ertoe doen, en wie eraan trekt. Geen inleiding, geen "hier is je overzicht", geen opsomming.
 
+Naast wikipagina's krijg je Jira-tickets — referenties die met `J` beginnen. Daar bestaat \
+een wijziging uit statusovergangen, nieuwe reacties en nieuw aangemaakte tickets; \
+veldwijzigingen krijg je bewust niet. Behandel ze verder identiek: `summary` zegt wat er \
+met het ticket gebeurd is en wat er in de reacties besloten of gevraagd wordt, niet dat het \
+"is bijgewerkt". Noem wie het ticket verzette en naar welke status.
+
 Verzin nooit titels, URL's, auteurs of referenties. Gebruik uitsluitend de referentie-id's \
 die je krijgt."""
 
@@ -169,6 +199,12 @@ for something.
 
 `tldr` is one paragraph, at most five sentences, naming the two or three threads that matter \
 and who is driving them. No preamble, no "here is your digest", no bullet list.
+
+Alongside wiki pages you get Jira tickets — references beginning with `J`. There a change \
+is a status transition, a new comment, or a newly created ticket; field edits are \
+deliberately withheld. Treat them identically: `summary` says what happened to the ticket \
+and what the comments decide or ask for, not that it "was updated". Name who moved it and \
+to which status.
 
 Never invent titles, URLs, authors or references. Use only the reference ids given."""
 
@@ -423,8 +459,464 @@ def classify(docs, state, me, cfg) -> list[dict]:
             kind = "updated"
         else:
             continue
-        items.append({"doc": doc, "changeKind": kind, "hash": digest})
+        items.append({"source": "wiki", "doc": doc, "changeKind": kind, "hash": digest})
     return items
+
+
+# ------------------------------------------------------------------------- jira
+
+# Everything the briefing can say about a ticket. `comment` is what makes the
+# payload worth reading — a transition tells you a ticket moved, a comment
+# tells you why.
+JIRA_FIELDS = [
+    "summary", "status", "issuetype", "project", "priority", "assignee",
+    "reporter", "creator", "labels", "parent", "created", "updated",
+    "description", "comment",
+]
+
+
+def jira_cfg(cfg) -> dict:
+    merged = dict(JIRA_DEFAULTS)
+    merged.update(cfg.get("jira") or {})
+    merged["baseUrl"] = (merged.get("baseUrl") or "").rstrip("/")
+    return merged
+
+
+def jira_enabled(cfg) -> bool:
+    jc = jira_cfg(cfg)
+    return bool(jc["baseUrl"] and jc["tokenCommand"])
+
+
+def jira_token(jc: dict) -> str:
+    """Cloud wants Basic email:token; a bare Data Center PAT goes as Bearer.
+
+    Raises rather than exits: a broken Jira credential must cost you the Jira
+    half of the briefing, never the wiki half.
+    """
+    cmd = (jc.get("tokenCommand") or "").strip()
+    if not cmd:
+        raise ApiError("jira: no tokenCommand configured", 401)
+    try:
+        out = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired as exc:
+        raise ApiError("jira: tokenCommand timed out") from exc
+    if out.returncode != 0:
+        raise ApiError(f"jira: tokenCommand failed: {out.stderr.strip()[:200]}", 401)
+    secret = out.stdout.strip()
+    if not secret or secret == "null":
+        raise ApiError("jira: tokenCommand produced no token", 401)
+    if secret.lower().startswith(("basic ", "bearer ")):
+        return secret
+    email = (jc.get("email") or "").strip()
+    if not email:
+        return f"Bearer {secret}"
+    return "Basic " + base64.b64encode(f"{email}:{secret}".encode()).decode()
+
+
+def jira_api_base(jc: dict) -> str:
+    """Where the REST calls go, which is not always where the links point.
+
+    A classic API token authenticates against the site itself. A scoped one is
+    rejected there with a bare 401 and has to go through the gateway, which
+    names the site by cloud id. `baseUrl` stays the site either way, so a
+    ticket link is always one a browser can open.
+    """
+    cloud = (jc.get("cloudId") or "").strip()
+    return f"https://api.atlassian.com/ex/jira/{cloud}" if cloud else jc["baseUrl"]
+
+
+def jira_cloud_id(jc: dict) -> str:
+    """Ask the site for its own id. Unauthenticated, and the one call that
+    deliberately does not go through the gateway."""
+    url = f"{jc['baseUrl']}/_edge/tenant_info"
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": f"{APP}/1"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            cloud = (json.loads(resp.read().decode()) or {}).get("cloudId")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise ApiError(f"jira: could not resolve the cloud id: {exc}") from exc
+    if not cloud:
+        raise ApiError("jira: the site reported no cloud id")
+    return cloud
+
+
+def jira_session(jc: dict, token: str, state: dict) -> tuple[dict, dict]:
+    """Settle how to reach this instance, and who we are on it.
+
+    The cloud id comes from the config, else from the last run, else from the
+    site — that last step only after a 401 has proved the direct route wrong,
+    so a classic token never pays for a lookup it does not need.
+    """
+    if not jc.get("cloudId"):
+        stored = (state.get("jira") or {}).get("cloudId")
+        if stored:
+            jc = dict(jc, cloudId=stored)
+    try:
+        return jc, jira_me(jc, token)
+    except ApiError as exc:
+        if exc.status != 401 or jc.get("cloudId"):
+            raise
+    routed = dict(jc, cloudId=jira_cloud_id(jc))
+    log(f"  jira: scoped token — routing through cloud id {routed['cloudId']}")
+    return routed, jira_me(routed, token)
+
+
+def jira_api(jc: dict, token: str, path: str, body: dict | None = None, attempts: int = 4) -> dict:
+    """Call the Jira REST API with backoff. Auth and bad-request never retry."""
+    url = f"{jira_api_base(jc)}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    backoff = [5, 15, 30]
+    last = None
+    for i in range(attempts):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": token,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"{APP}/1",
+            },
+            method="POST" if data is not None else "GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode()[:200]
+            except (OSError, UnicodeDecodeError):
+                pass
+            # A rejected credential, a bad JQL or a missing endpoint will not
+            # fix itself on the fourth attempt.
+            if exc.code in (400, 401, 403, 404, 410):
+                raise ApiError(f"jira {path}: HTTP {exc.code} {detail}", exc.code) from exc
+            last = ApiError(f"jira {path}: HTTP {exc.code}", exc.code)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            last = ApiError(f"jira {path}: {exc}")
+        if i < attempts - 1:
+            wait = backoff[min(i, len(backoff) - 1)]
+            log(f"  {last.reason} — retry in {wait}s")
+            time.sleep(wait)
+    raise last or ApiError(f"jira {path}: unreachable")
+
+
+def jira_me(jc, token) -> dict:
+    """Always a live call: it is also how a wrong route announces itself, and
+    a cached answer would hide the 401 that tells us to use the gateway."""
+    data = jira_api(jc, token, "/rest/api/3/myself")
+    return {
+        "id": data.get("accountId") or data.get("key") or "",
+        "name": data.get("displayName") or "",
+    }
+
+
+def jira_jql(jc: dict, since: datetime) -> str:
+    """The configured filter, bounded by the watermark.
+
+    JQL takes wall-clock minutes in the instance's own timezone, not an ISO
+    instant, so the bound is deliberately loose — five minutes of slack, with
+    the exact cutoff applied per event client-side where it can be precise.
+    """
+    stamp = (since - timedelta(minutes=5)).astimezone().strftime("%Y-%m-%d %H:%M")
+    clause = f'updated >= "{stamp}"'
+    extra = (jc.get("jql") or "").strip().rstrip(";")
+    if extra:
+        clause = f"({extra}) AND {clause}"
+    return clause + " ORDER BY updated DESC"
+
+
+def jira_search(jc, token, since: datetime, max_pages: int = 10) -> list[dict]:
+    jql = jira_jql(jc, since)
+    log(f"  jira jql: {jql}")
+    issues: list[dict] = []
+    seen: set[str] = set()
+    cursor = None
+    for _ in range(max_pages):
+        body = {
+            "jql": jql,
+            "maxResults": 100,
+            "fields": JIRA_FIELDS,
+            "expand": "changelog",
+        }
+        if cursor:
+            body["nextPageToken"] = cursor
+        try:
+            payload = jira_api(jc, token, "/rest/api/3/search/jql", body)
+        except ApiError as exc:
+            if exc.status in (404, 410) and not issues:
+                return jira_search_legacy(jc, token, jql, max_pages)
+            raise
+        batch = payload.get("issues") or []
+        for issue in batch:
+            key = str(issue.get("id") or issue.get("key") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            issues.append(issue)
+        cursor = payload.get("nextPageToken")
+        if payload.get("isLast") or not cursor or not batch:
+            break
+    return issues
+
+
+def jira_search_legacy(jc, token, jql: str, max_pages: int) -> list[dict]:
+    """Jira Data Center, and Cloud before the token-paged search, only have
+    the offset endpoint. Same shape of result, different paging."""
+    log("  jira: falling back to the offset search endpoint")
+    issues: list[dict] = []
+    for page in range(max_pages):
+        payload = jira_api(
+            jc,
+            token,
+            "/rest/api/2/search",
+            {
+                "jql": jql,
+                "startAt": page * 100,
+                "maxResults": 100,
+                "fields": JIRA_FIELDS,
+                "expand": ["changelog"],
+            },
+        )
+        batch = payload.get("issues") or []
+        issues.extend(batch)
+        total = int(payload.get("total") or 0)
+        if len(batch) < 100 or len(issues) >= total:
+            break
+    return issues
+
+
+def adf_text(node) -> str:
+    """Flatten Atlassian Document Format to plain prose.
+
+    Jira Cloud returns descriptions and comments as a document tree. The model
+    wants the words, so marks and layout nodes are dropped and block
+    boundaries become newlines. A v2 instance sends a plain string, which
+    falls through unchanged.
+    """
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_text(child) for child in node)
+    if not isinstance(node, dict):
+        return ""
+    kind = node.get("type")
+    if kind == "text":
+        return node.get("text") or ""
+    if kind == "hardBreak":
+        return "\n"
+    if kind == "mention":
+        return "@" + ((node.get("attrs") or {}).get("text") or "").lstrip("@")
+    if kind == "emoji":
+        return (node.get("attrs") or {}).get("shortName") or ""
+    if kind in ("inlineCard", "blockCard"):
+        return (node.get("attrs") or {}).get("url") or ""
+    inner = adf_text(node.get("content"))
+    if kind == "listItem":
+        return "- " + inner.strip() + "\n"
+    if kind in ("paragraph", "heading", "blockquote", "codeBlock", "panel", "rule"):
+        return inner + "\n"
+    return inner
+
+
+def adf_plain(node, limit: int = 1200) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", adf_text(node)).strip()
+    if len(text) > limit:
+        text = text[:limit] + f"\n[… ingekort, nog {len(text) - limit} tekens]"
+    return text
+
+
+def jira_classify(issues, state, me, jc, since: datetime) -> list[dict]:
+    """Keep the changes worth briefing on: new tickets, status moves, comments.
+
+    A field edit — a re-estimate, a label, a sprint move — is real work, but it
+    is not something a colleague needs read to them at nine, and including it
+    would turn the digest into a changelog.
+    """
+    seen = (state.get("jira") or {}).get("seen") or {}
+    include_own = bool(jc.get("includeOwnChanges"))
+    mine = me.get("id") or ""
+    items = []
+    for issue in issues:
+        fields = issue.get("fields") or {}
+        ident = str(issue.get("id") or issue.get("key") or "")
+        if not ident:
+            continue
+
+        # Per-issue floor: the later of the window and the last event we have
+        # already reported, so the watermark's slack cannot double-report.
+        floor = since
+        last_event = (seen.get(ident) or {}).get("lastEventAt")
+        if last_event:
+            try:
+                floor = max(floor, parse_iso(last_event))
+            except ValueError:
+                pass
+
+        created = fields.get("created")
+        is_new = False
+        if created:
+            try:
+                is_new = parse_iso(created) > floor
+            except ValueError:
+                is_new = False
+
+        transitions = []
+        for history in ((issue.get("changelog") or {}).get("histories") or []):
+            when = history.get("created")
+            if not when:
+                continue
+            try:
+                if parse_iso(when) <= floor:
+                    continue
+            except ValueError:
+                continue
+            author = history.get("author") or {}
+            if not include_own and mine and author.get("accountId") == mine:
+                continue
+            for change in history.get("items") or []:
+                if (change.get("field") or "").lower() != "status":
+                    continue
+                transitions.append({
+                    "at": when,
+                    "by": author.get("displayName") or "—",
+                    "from": change.get("fromString") or "—",
+                    "to": change.get("toString") or "—",
+                })
+
+        comments = []
+        for comment in ((fields.get("comment") or {}).get("comments") or []):
+            when = comment.get("created")
+            if not when:
+                continue
+            try:
+                if parse_iso(when) <= floor:
+                    continue
+            except ValueError:
+                continue
+            author = comment.get("author") or {}
+            if not include_own and mine and author.get("accountId") == mine:
+                continue
+            comments.append({
+                "at": when,
+                "by": author.get("displayName") or "—",
+                "body": adf_plain(comment.get("body"), 1200),
+            })
+
+        if is_new and not include_own and mine:
+            creator = (fields.get("creator") or {}).get("accountId")
+            if creator == mine:
+                is_new = False  # your own ticket; only what others did to it counts
+
+        if not (is_new or transitions or comments):
+            continue
+
+        stamps = [t["at"] for t in transitions] + [c["at"] for c in comments]
+        if is_new and created:
+            stamps.append(created)
+        items.append({
+            "source": "jira",
+            "issue": issue,
+            "changeKind": "new" if is_new else "updated",
+            "transitions": transitions,
+            "comments": comments,
+            "lastEventAt": max(stamps) if stamps else (fields.get("updated") or ""),
+        })
+    return items
+
+
+def jira_actor(item) -> str:
+    """Who to put on the card: whoever did the most recent thing to the ticket."""
+    events = item.get("transitions", []) + item.get("comments", [])
+    if events:
+        return max(events, key=lambda e: e.get("at") or "").get("by") or "—"
+    fields = item["issue"].get("fields") or {}
+    for role in ("creator", "reporter", "assignee"):
+        who = (fields.get(role) or {}).get("displayName")
+        if who:
+            return who
+    return "—"
+
+
+def jira_url(jc, issue) -> str:
+    return f"{jc['baseUrl']}/browse/{issue.get('key', '')}"
+
+
+def jira_base_item(jc, item) -> dict:
+    issue = item["issue"]
+    fields = issue.get("fields") or {}
+    key = issue.get("key") or ""
+    summary = fields.get("summary") or ""
+    return {
+        # Namespaced: read.json holds ids from both sources, and an Outline
+        # uuid must never be able to clear a ticket.
+        "id": "jira:" + str(issue.get("id") or key),
+        "source": "jira",
+        "url": jira_url(jc, issue),
+        "title": f"{key} — {summary}".strip(" —") or key,
+        "collection": {"name": ((fields.get("project") or {}).get("name")) or "—"},
+        "author": {"name": jira_actor(item)},
+        "status": ((fields.get("status") or {}).get("name")) or "",
+        "changeKind": item["changeKind"],
+        "updatedAt": item.get("lastEventAt") or fields.get("updated"),
+    }
+
+
+def jira_excerpt(item, language: str) -> str:
+    """The unsummarised line: what happened, without a model having read it."""
+    nl = language == "nl"
+    bits = []
+    for move in item.get("transitions", [])[-2:]:
+        bits.append(f"{move['from']} → {move['to']}")
+    count = len(item.get("comments", []))
+    if count:
+        bits.append(f"{count} nieuwe reactie(s)" if nl else f"{count} new comment(s)")
+    if not bits and item.get("changeKind") == "new":
+        fields = item["issue"].get("fields") or {}
+        bits.append(adf_plain(fields.get("description"), 140) or
+                    ("nieuw ticket" if nl else "new ticket"))
+    return " · ".join(bits)
+
+
+def jira_block(ref: str, item, jc) -> str:
+    issue = item["issue"]
+    fields = issue.get("fields") or {}
+    label = "NIEUW TICKET" if item["changeKind"] == "new" else "TICKETWIJZIGING"
+    lines = [
+        f"### {ref} — {label}",
+        f"ticket: {issue.get('key', '')} — {fields.get('summary') or ''}",
+        f"project: {((fields.get('project') or {}).get('name')) or '—'}",
+        f"type: {((fields.get('issuetype') or {}).get('name')) or '—'}",
+        f"status: {((fields.get('status') or {}).get('name')) or '—'}",
+        f"toegewezen: {((fields.get('assignee') or {}).get('displayName')) or 'niemand'}",
+        f"bijgewerkt: {item.get('lastEventAt') or fields.get('updated') or ''}",
+        "",
+    ]
+    if item["transitions"]:
+        lines.append("statuswijzigingen:")
+        for move in item["transitions"]:
+            lines.append(f"- {move['at']} {move['by']}: {move['from']} → {move['to']}")
+        lines.append("")
+    if item["comments"]:
+        lines.append("nieuwe reacties:")
+        for comment in item["comments"]:
+            # Indented continuation, so a multi-paragraph comment stays one
+            # entry in the list rather than reading as several.
+            body = comment["body"].replace("\n", "\n  ")
+            lines.append(f"- {comment['by']}: {body}")
+        lines.append("")
+    if item["changeKind"] == "new":
+        description = adf_plain(fields.get("description"), 4000)
+        if description:
+            lines.append("omschrijving:")
+            lines.append(description)
+            lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- payload build
@@ -434,72 +926,94 @@ def baseline_path(doc_id: str) -> Path:
     return BASELINE_DIR / f"{doc_id}.md"
 
 
-def build_payload(items, collections, cfg) -> tuple[str, dict]:
-    """Render the LLM input and the ref→document map used to rejoin facts.
-
-    The model only ever sees and returns `D<n>` refs; every title, URL, author
-    and collection is joined back from our own data afterwards, so a
-    hallucinated link cannot reach the widget.
-    """
+def wiki_block(ref: str, item, collections, cfg) -> str:
     per_diff = int(cfg["perDocDiffChars"])
     per_new = int(cfg["perDocNewChars"])
-    budget = int(cfg["payloadCharBudget"])
+    doc = item["doc"]
+    collection = collections.get(doc.get("collectionId") or "", "—")
+    author = (doc.get("updatedBy") or {}).get("name") or "—"
+    text = doc.get("text") or ""
 
-    blocks, refmap, used = [], {}, 0
-    for index, item in enumerate(items, start=1):
-        doc = item["doc"]
-        ref = f"D{index}"
-        refmap[ref] = item
-        collection = collections.get(doc.get("collectionId") or "", "—")
-        author = (doc.get("updatedBy") or {}).get("name") or "—"
-        text = doc.get("text") or ""
-
-        if item["changeKind"] == "new":
-            body = text[:per_new]
-            if len(text) > per_new:
-                body += f"\n[… ingekort, nog {len(text) - per_new} tekens]"
-            kind_label = "NIEUWE PAGINA"
+    if item["changeKind"] == "new":
+        body = text[:per_new]
+        if len(text) > per_new:
+            body += f"\n[… ingekort, nog {len(text) - per_new} tekens]"
+        kind_label = "NIEUWE PAGINA"
+    else:
+        old = ""
+        bp = baseline_path(doc["id"])
+        if bp.exists():
+            try:
+                old = bp.read_text()
+            except OSError:
+                old = ""
+        if old:
+            diff = "\n".join(
+                difflib.unified_diff(normalise(old), normalise(text), lineterm="", n=3)
+            )
+            body = diff if diff.strip() else "(alleen metadata gewijzigd)"
+            kind_label = "WIJZIGING (unified diff)"
         else:
-            old = ""
-            bp = baseline_path(doc["id"])
-            if bp.exists():
-                try:
-                    old = bp.read_text()
-                except OSError:
-                    old = ""
-            if old:
-                diff = "\n".join(
-                    difflib.unified_diff(
-                        normalise(old), normalise(text), lineterm="", n=3
-                    )
-                )
-                body = diff if diff.strip() else "(alleen metadata gewijzigd)"
-                kind_label = "WIJZIGING (unified diff)"
-            else:
-                body = text[:per_new]
-                kind_label = "GEWIJZIGD (geen eerdere versie bekend, volledige tekst)"
-            if len(body) > per_diff:
-                half = per_diff // 2
-                body = f"{body[:half]}\n[… {len(body) - per_diff} tekens overgeslagen …]\n{body[-half:]}"
+            body = text[:per_new]
+            kind_label = "GEWIJZIGD (geen eerdere versie bekend, volledige tekst)"
+        if len(body) > per_diff:
+            half = per_diff // 2
+            body = f"{body[:half]}\n[… {len(body) - per_diff} tekens overgeslagen …]\n{body[-half:]}"
 
-        block = (
-            f"### {ref} — {kind_label}\n"
-            f"titel: {doc.get('title', '')}\n"
-            f"collectie: {collection}\n"
-            f"auteur: {author}\n"
-            f"bijgewerkt: {doc.get('updatedAt', '')}\n\n"
-            f"{body}\n"
-        )
+    return (
+        f"### {ref} — {kind_label}\n"
+        f"titel: {doc.get('title', '')}\n"
+        f"collectie: {collection}\n"
+        f"auteur: {author}\n"
+        f"bijgewerkt: {doc.get('updatedAt', '')}\n\n"
+        f"{body}\n"
+    )
+
+
+def build_payload(items, jira_items, collections, cfg) -> tuple[str, dict]:
+    """Render the LLM input and the ref→change map used to rejoin facts.
+
+    The model only ever sees and returns `D<n>` (wiki) and `J<n>` (Jira) refs;
+    every title, URL, author, ticket key and collection is joined back from our
+    own data afterwards, so a hallucinated identifier cannot reach the widget.
+
+    Wiki blocks go first and the budget is spent in that order: when a day is
+    too big for one payload, losing the tail of the tickets beats losing a
+    document that was diffed against a baseline we have already advanced past.
+    """
+    budget = int(cfg["payloadCharBudget"])
+    jc = jira_cfg(cfg)
+    blocks, refmap, used, dropped = [], {}, 0, 0
+
+    for index, item in enumerate(items, start=1):
+        ref = f"D{index}"
+        block = wiki_block(ref, item, collections, cfg)
         if used + len(block) > budget:
-            log(f"  payload budget reached at {ref}; {len(items) - index + 1} blocks dropped")
-            for dropped in range(index, len(items) + 1):
-                refmap.pop(f"D{dropped}", None)
+            dropped = len(items) - index + 1 + len(jira_items)
             break
+        refmap[ref] = item
         blocks.append(block)
         used += len(block)
 
+    docs_in = len(blocks)
+    if not dropped:
+        for index, item in enumerate(jira_items, start=1):
+            ref = f"J{index}"
+            block = jira_block(ref, item, jc)
+            if used + len(block) > budget:
+                dropped = len(jira_items) - index + 1
+                break
+            refmap[ref] = item
+            blocks.append(block)
+            used += len(block)
+
+    if dropped:
+        log(f"  payload budget reached; {dropped} block(s) dropped")
+
+    issues_in = len(blocks) - docs_in
     header = (
-        f"Wijzigingen op de wiki, {len(blocks)} document(en).\n"
+        f"Wijzigingen sinds de vorige briefing: {docs_in} wikipagina('s) "
+        f"en {issues_in} Jira-ticket(s).\n"
         "Lever precies één item per referentie.\n\n"
     )
     return header + "\n".join(blocks), refmap
@@ -607,10 +1121,23 @@ def excerpt(text: str, limit: int = 140) -> str:
     return body[:limit]
 
 
+def fallback_summary(cfg, item) -> str:
+    """What a row says when no model has read it — the unsummarised tail, a
+    degraded run, and every pulse row."""
+    if item.get("source") == "jira":
+        return jira_excerpt(item, cfg.get("language", "nl"))
+    return excerpt(item["doc"].get("text") or "")
+
+
 def base_item(cfg, item, collections) -> dict:
+    """One row, before any summary. Both sources land in the same shape, so
+    the overlay's card never has to know which pipeline produced it."""
+    if item.get("source") == "jira":
+        return jira_base_item(jira_cfg(cfg), item)
     doc = item["doc"]
     return {
         "id": doc["id"],
+        "source": "wiki",
         "url": doc_url(cfg, doc),
         "title": doc.get("title") or "(zonder titel)",
         "collection": {"name": collections.get(doc.get("collectionId") or "", "—")},
@@ -649,7 +1176,7 @@ def join_llm(cfg, llm, refmap, collections) -> list[dict]:
             {
                 "rank": 900 + len(items),
                 "priority": "low",
-                "summary": (item["doc"].get("text") or "")[:140].replace("\n", " "),
+                "summary": fallback_summary(cfg, item),
                 "whyItMattersToMe": "",
                 "suggestedAction": "fyi",
                 "tags": [],
@@ -662,18 +1189,23 @@ def join_llm(cfg, llm, refmap, collections) -> list[dict]:
     return items
 
 
+def change_stamp(item) -> str:
+    """When the change happened, whichever source it came from."""
+    if item.get("source") == "jira":
+        return item.get("lastEventAt") or ""
+    return item["doc"].get("updatedAt") or ""
+
+
 def mechanical_items(cfg, refmap, collections) -> list[dict]:
     items = []
-    ordered = sorted(
-        refmap.values(), key=lambda i: i["doc"].get("updatedAt") or "", reverse=True
-    )
+    ordered = sorted(refmap.values(), key=change_stamp, reverse=True)
     for position, item in enumerate(ordered, start=1):
         entry = base_item(cfg, item, collections)
         entry.update(
             {
                 "rank": position,
                 "priority": "low",
-                "summary": excerpt(item["doc"].get("text") or ""),
+                "summary": fallback_summary(cfg, item),
                 "whyItMattersToMe": "",
                 "suggestedAction": "fyi",
                 "tags": [],
@@ -686,7 +1218,7 @@ def mechanical_items(cfg, refmap, collections) -> list[dict]:
 # ------------------------------------------------------------------ the commit
 
 
-def commit(state, items, watermark: datetime, collections, me, status: str) -> None:
+def commit(state, items, watermark: datetime, collections, me, status: str, jira=None) -> None:
     """Advance the cursor, the baselines and the stamp together.
 
     Called only once `digest.json` is on disk. Until this runs a failed attempt
@@ -710,6 +1242,26 @@ def commit(state, items, watermark: datetime, collections, me, status: str) -> N
         except OSError as exc:
             log(f"  baseline write failed for {doc['id']}: {exc}")
 
+    # `jira is None` means we never reached Jira this run, so its cursor stays
+    # exactly where it was and the next attempt sees the identical change set.
+    if jira is not None:
+        jstate = state.setdefault("jira", {})
+        jseen = jstate.setdefault("seen", {})
+        for item in jira.get("items") or []:
+            issue = item["issue"]
+            jseen[str(issue.get("id") or issue.get("key"))] = {
+                "key": issue.get("key"),
+                "lastEventAt": item.get("lastEventAt"),
+                "lastReported": today,
+            }
+        if jira.get("watermark"):
+            jstate["watermark"] = {"updatedAt": iso_utc(jira["watermark"])}
+        if jira.get("me"):
+            jstate["me"] = jira["me"]
+        if jira.get("cloudId"):
+            jstate["cloudId"] = jira["cloudId"]
+        prune_jira_seen(jstate, state)
+
     state["watermark"] = {"updatedAt": iso_utc(watermark)}
     state["collections"] = collections
     state["collectionsFetchedAt"] = iso_utc(datetime.now(timezone.utc))
@@ -723,6 +1275,17 @@ def commit(state, items, watermark: datetime, collections, me, status: str) -> N
     state["failures"] = {"consecutive": 0, "lastError": None, "lastErrorAt": None}
     prune_baselines(state)
     write_json_atomic(STATE_PATH, state)
+
+
+def prune_jira_seen(jstate, state) -> None:
+    """The ticket cursor is per-issue, so it grows for ever unless trimmed. A
+    ticket nobody has touched inside the retention window is well past the
+    point where a stale marker could suppress a real change."""
+    days = int(state.get("baselineRetentionDays", DEFAULTS["baselineRetentionDays"]))
+    cutoff = (datetime.now().astimezone() - timedelta(days=days)).strftime("%Y-%m-%d")
+    seen = jstate.get("seen") or {}
+    for key in [k for k, v in seen.items() if (v.get("lastReported") or "") < cutoff]:
+        seen.pop(key, None)
 
 
 def prune_baselines(state) -> None:
@@ -789,6 +1352,13 @@ def summon_overlay() -> None:
         log(f"  overlay summon skipped: {exc}")
 
 
+def jira_commit(items, jira_state):
+    """`None` when Jira was never reached, so its cursor stays put."""
+    if jira_state is None:
+        return None
+    return {"items": items, **jira_state}
+
+
 def write_digest(payload: dict) -> None:
     if DIGEST_PATH.exists():
         try:
@@ -829,15 +1399,8 @@ def cmd_run(args) -> int:
     state = load_json(STATE_PATH, {})
     token = get_token(cfg)
 
-    # Window: explicit override, else the stored watermark, else a bootstrap.
-    if args.window:
-        since = datetime.now(timezone.utc) - parse_duration(args.window)
-    else:
-        stored = (state.get("watermark") or {}).get("updatedAt")
-        if stored:
-            since = parse_iso(stored) - timedelta(minutes=5)
-        else:
-            since = datetime.now(timezone.utc) - timedelta(days=int(cfg["bootstrapDays"]))
+    since = window_since(args.window, (state.get("watermark") or {}).get("updatedAt"),
+                         int(cfg["bootstrapDays"]))
     log(f"looking for changes since {iso_utc(since)}")
 
     try:
@@ -860,44 +1423,96 @@ def cmd_run(args) -> int:
     items = classify(docs, state, me, cfg)
     log(f"{len(docs)} document(s) in window, {len(items)} relevant after filtering")
 
+    # The second source, on the same cursor discipline: its own watermark,
+    # advanced in the same commit. A Jira outage is noted on the digest and
+    # costs you the tickets, not the morning.
+    jc = jira_cfg(cfg)
+    jira_items: list[dict] = []
+    jira_state = None
+    jira_degraded = None
+    if jira_enabled(cfg):
+        jira_since = window_since(
+            args.window,
+            ((state.get("jira") or {}).get("watermark") or {}).get("updatedAt"),
+            int(jc["bootstrapDays"]),
+        )
+        log(f"looking for tickets since {iso_utc(jira_since)}")
+        try:
+            jira_token_value = jira_token(jc)
+            jc, jira_identity = jira_session(jc, jira_token_value, state)
+            issues = jira_search(jc, jira_token_value, jira_since)
+            jira_items = jira_classify(issues, state, jira_identity, jc, jira_since)
+            # The cursor advances past everything we looked at, field edits
+            # included — those were read and deliberately dropped, and
+            # re-reading them tomorrow would not change that.
+            newest_issue = jira_since
+            for issue in issues:
+                stamp = (issue.get("fields") or {}).get("updated")
+                if not stamp:
+                    continue
+                try:
+                    newest_issue = max(newest_issue, parse_iso(stamp))
+                except ValueError:
+                    pass
+            jira_state = {
+                "watermark": newest_issue,
+                "me": jira_identity,
+                "cloudId": jc.get("cloudId") or "",
+            }
+            log(f"{len(issues)} ticket(s) in window, {len(jira_items)} worth briefing")
+        except ApiError as exc:
+            jira_degraded = "jira_auth_failed" if exc.status in (401, 403) else "jira_unreachable"
+            log(f"jira fetch failed ({jira_degraded}): {exc.reason}")
+
     max_items = int(cfg["maxItems"])
     omitted = 0
     summarise = items
     if len(items) > max_items:
-        summarise = sorted(items, key=lambda i: i["doc"].get("updatedAt") or "", reverse=True)[:max_items]
+        summarise = sorted(items, key=change_stamp, reverse=True)[:max_items]
         omitted = len(items) - max_items
-        log(f"  capping at {max_items}, {omitted} omitted (all still marked seen)")
+        log(f"  capping at {max_items} page(s), {omitted} omitted (all still marked seen)")
+
+    # Counted separately: a truncated ticket list said "469 documents omitted"
+    # on a day no document was touched at all.
+    jira_max = int(jc["maxItems"])
+    jira_omitted = 0
+    jira_summarise = jira_items
+    if len(jira_items) > jira_max:
+        jira_summarise = sorted(jira_items, key=change_stamp, reverse=True)[:jira_max]
+        jira_omitted = len(jira_items) - jira_max
+        log(f"  capping at {jira_max} ticket(s), {jira_omitted} omitted")
 
     # An empty day is a success: the stamp is written and the cursor advances,
     # so tomorrow does not re-report today.
-    if not summarise:
+    if not summarise and not jira_summarise:
         digest = {
             "schemaVersion": SCHEMA_VERSION,
             "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
             "coversSince": iso_utc(since),
             "status": "empty",
-            "degradedReason": None,
+            "degradedReason": jira_degraded,
             "stats": {
                 "documentsChanged": 0, "documentsSummarized": 0, "documentsOmitted": 0,
+                "issuesChanged": 0, "issuesSummarized": 0, "issuesOmitted": 0,
                 "collections": 0, "authors": 0,
                 "daysCovered": max(1, (datetime.now(timezone.utc) - since).days),
             },
-            "tldr": "Geen wijzigingen op de wiki sinds je vorige overzicht."
+            "tldr": "Geen wijzigingen sinds je vorige overzicht."
             if cfg.get("language") == "nl"
-            else "No wiki changes since your last digest.",
+            else "Nothing changed since your last digest.",
             "items": [],
         }
         if args.dry_run:
             print(json.dumps(digest, ensure_ascii=False, indent=2))
             return 0
         write_digest(digest)
-        commit(state, [], newest, collections, me, "empty")
+        commit(state, [], newest, collections, me, "empty", jira_commit([], jira_state))
         STAMP_PATH.write_text(today + "\n")
         if args.show:
             summon_overlay()
         return 0
 
-    payload, refmap = build_payload(summarise, collections, cfg)
+    payload, refmap = build_payload(summarise, jira_summarise, collections, cfg)
     try:
         PAYLOAD_PATH.write_text(payload)
         os.chmod(PAYLOAD_PATH, 0o600)
@@ -931,13 +1546,21 @@ def cmd_run(args) -> int:
         items_out = mechanical_items(cfg, refmap, collections)
         count = len(items_out)
         tldr = (
-            f"{count} pagina('s) gewijzigd; samenvattingen zijn nu niet beschikbaar."
+            f"{count} wijziging(en); samenvattingen zijn nu niet beschikbaar."
             if cfg.get("language") == "nl"
-            else f"{count} page(s) changed; summaries unavailable."
+            else f"{count} change(s); summaries unavailable."
         )
 
-    if omitted:
+    if omitted or jira_omitted:
         degraded = degraded or "truncated"
+    # A Jira outage never sets `status`: the wiki half is a complete digest of
+    # what we could reach, and leaving the stamp unset over it would re-open
+    # the overlay on every retry until the credential is fixed.
+    if jira_degraded:
+        degraded = degraded or jira_degraded
+
+    wiki_out = [row for row in items_out if row.get("source") != "jira"]
+    jira_out = [row for row in items_out if row.get("source") == "jira"]
 
     digest = {
         "schemaVersion": SCHEMA_VERSION,
@@ -947,8 +1570,11 @@ def cmd_run(args) -> int:
         "degradedReason": degraded,
         "stats": {
             "documentsChanged": len(items),
-            "documentsSummarized": len(items_out),
+            "documentsSummarized": len(wiki_out),
             "documentsOmitted": omitted,
+            "issuesChanged": len(jira_items),
+            "issuesSummarized": len(jira_out),
+            "issuesOmitted": jira_omitted,
             "collections": len({i["collection"]["name"] for i in items_out}),
             "authors": len({i["author"]["name"] for i in items_out}),
             "daysCovered": max(1, (datetime.now(timezone.utc) - since).days),
@@ -957,7 +1583,8 @@ def cmd_run(args) -> int:
         "items": items_out,
     }
     write_digest(digest)
-    commit(state, items, newest, collections, me, status)
+    commit(state, items, newest, collections, me, status,
+           jira_commit(jira_summarise, jira_state))
 
     # A degraded digest deliberately leaves the stamp unset, so the next
     # scheduled retry upgrades it in place rather than skipping the day.
@@ -970,6 +1597,22 @@ def cmd_run(args) -> int:
     if args.show:
         summon_overlay()
     return 0
+
+
+def window_since(window: str | None, stored: str | None, bootstrap_days: int) -> datetime:
+    """Explicit override, else the stored watermark, else a bootstrap.
+
+    The five minutes of slack are why every source also filters client-side:
+    the cursor errs towards showing a change twice rather than losing one.
+    """
+    if window:
+        return datetime.now(timezone.utc) - parse_duration(window)
+    if stored:
+        try:
+            return parse_iso(stored) - timedelta(minutes=5)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc) - timedelta(days=bootstrap_days)
 
 
 def parse_duration(text: str) -> timedelta:
@@ -995,7 +1638,7 @@ def cmd_pulse(_args) -> int:
     It writes the rows it counted, not just the count: a badge that says "1"
     over an overlay that can only read `digest.json` is a promise the dialog
     cannot keep. These rows carry no summary — that is the morning digest's
-    job — only enough to name the page and open it.
+    job — only enough to name the page or the ticket and open it.
     """
     cfg = load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1039,7 +1682,7 @@ def cmd_pulse(_args) -> int:
                 {
                     "rank": position,
                     "priority": "low",
-                    "summary": excerpt(item["doc"].get("text") or ""),
+                    "summary": fallback_summary(cfg, item),
                     "whyItMattersToMe": "",
                     "suggestedAction": "fyi",
                     "tags": [],
@@ -1049,6 +1692,34 @@ def cmd_pulse(_args) -> int:
     except (ApiError, SystemExit) as exc:
         health = "stale"
         log(f"pulse: {exc}")
+
+    # Its own try: a Jira that will not answer must not zero a wiki count we
+    # already have.
+    if jira_enabled(cfg):
+        jc = jira_cfg(cfg)
+        try:
+            jira_secret = jira_token(jc)
+            jc, jira_identity = jira_session(jc, jira_secret, state)
+            issues = jira_search(jc, jira_secret, anchor, max_pages=3)
+            found = jira_classify(issues, state, jira_identity, jc, anchor)
+            count += len(found)
+            ordered = sorted(found, key=change_stamp, reverse=True)
+            for item in ordered[:PULSE_MAX_ITEMS]:
+                entry = base_item(cfg, item, {})
+                entry.update(
+                    {
+                        "rank": len(entries) + 1,
+                        "priority": "low",
+                        "summary": fallback_summary(cfg, item),
+                        "whyItMattersToMe": "",
+                        "suggestedAction": "fyi",
+                        "tags": [],
+                    }
+                )
+                entries.append(entry)
+        except (ApiError, SystemExit) as exc:
+            health = "stale"
+            log(f"pulse jira: {exc}")
 
     age = datetime.now(timezone.utc) - anchor
     write_json_atomic(
@@ -1113,6 +1784,10 @@ def cmd_status(_args) -> int:
     print(f"last run    {state.get('lastRun', '(never)')}")
     print(f"failures    {state.get('failures', {}).get('consecutive', 0)}")
     print(f"seen docs   {len(state.get('seen') or {})}")
+    jstate = state.get("jira") or {}
+    print(f"jira        {(jstate.get('watermark') or {}).get('updatedAt', '(off or never run)')}"
+          f"  seen issues={len(jstate.get('seen') or {})}"
+          f"  cloudId={jstate.get('cloudId') or '(direct)'}")
     print(f"digest      {digest.get('generatedAt', '(none)')} status={digest.get('status', '-')} items={len(digest.get('items') or [])}")
     return 0
 

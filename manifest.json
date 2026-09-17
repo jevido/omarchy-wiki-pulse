@@ -4,7 +4,7 @@
   "name": "Wiki Pulse",
   "version": "1.0.0",
   "author": "Jeffrey Duivenvoorden",
-  "description": "A daily digest of what your colleagues wrote on the wiki — fullscreen each morning, a silent badge the rest of the day",
+  "description": "A daily digest of what your colleagues wrote on the wiki and moved in Jira — fullscreen each morning, a silent badge the rest of the day",
   "kinds": [
     "bar-widget",
     "overlay"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Wiki Pulse",
-    "description": "Unread wiki changes since the morning digest",
+    "description": "Unread wiki and Jira changes since the morning digest",
     "category": "Information",
     "allowMultiple": false,
     "defaultSection": "right",

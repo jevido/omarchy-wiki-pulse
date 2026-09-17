@@ -8,7 +8,7 @@ import "DigestModel.js" as Model
 // The quiet half of the plugin: a count, and nothing else.
 //
 // It never notifies, never animates for attention and never opens anything on
-// its own. The whole point of the app is that the wiki interrupts exactly once
+// its own. The whole point of the app is that work interrupts you exactly once
 // a day; everything between those moments has to be glanceable and silent.
 BarWidget {
   id: root
@@ -89,7 +89,7 @@ BarWidget {
     labelVisible: !root.vertical
     hasVisualContent: true
     // Three states worth telling apart at a glance: something new (full
-    // strength), nothing new (present but receding), and a wiki we could not
+    // strength), nothing new (present but receding), and a source we could not
     // reach (clearly dimmed -- a confident count we cannot back up would be
     // worse than no count).
     opacity: root.stale ? 0.4 : (root.count > 0 ? 1.0 : 0.62)
@@ -99,8 +99,8 @@ BarWidget {
     readonly property string shortcutHint: root.setting("shortcut", "Super+D")
     tooltipText: {
       var suffix = shortcutHint ? "  (" + shortcutHint + ")" : ""
-      if (root.stale) return qsTr("Wiki unreachable — count may be out of date") + suffix
-      if (root.count === 0) return qsTr("Nothing new on the wiki") + suffix
+      if (root.stale) return qsTr("A source was unreachable — count may be out of date") + suffix
+      if (root.count === 0) return qsTr("Nothing new to read") + suffix
       var parts = []
       if (root.unreadDigest > 0) parts.push(root.unreadDigest + qsTr(" in today's digest"))
       if (root.sinceDigest > 0) parts.push(root.sinceDigest + qsTr(" since this morning"))

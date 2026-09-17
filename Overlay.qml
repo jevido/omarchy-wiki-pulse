@@ -45,16 +45,26 @@ Item {
   readonly property var unreadDigest: Model.sorted(Model.unreadItems(root.digest, root.read))
   readonly property var unreadPulse: Model.unseenPulse(root.pulse, root.read.pulseSeen)
 
+  // The summarised half, split by source: the wiki block, then the Jira block.
+  // Ranking still happens across both in the model -- the split is about where
+  // the eye lands, not about which change matters more.
+  readonly property var summarisedAll: root.showingAll ? root.digestItems : root.unreadDigest
+  readonly property var wikiRows: Model.bySource(root.summarisedAll, "wiki")
+  readonly property var jiraRows: Model.bySource(root.summarisedAll, "jira")
+  // The tail keeps the same order, but it stays one section: that divider is a
+  // time boundary, and splitting it by source would claim these rows were
+  // triaged when nothing has read them.
+  readonly property var freshAll: root.showingAll ? root.pulseItems : root.unreadPulse
+  readonly property var freshRows: Model.bySource(root.freshAll, "wiki")
+                                        .concat(Model.bySource(root.freshAll, "jira"))
+
   // The list the whole view derives from -- the numeral, the keyboard, the
   // cards and the empty state all read this one property, so they cannot
   // disagree about what is on screen.
-  readonly property var rows: root.showingAll
-                              ? root.digestItems.concat(root.pulseItems)
-                              : root.unreadDigest.concat(root.unreadPulse)
-  // Where the "Since this morning" divider goes: after the summarised rows.
-  readonly property int freshFrom: root.showingAll
-                                   ? root.digestItems.length
-                                   : root.unreadDigest.length
+  readonly property var rows: root.wikiRows.concat(root.jiraRows).concat(root.freshRows)
+  // Section headings, keyed by the row index they sit above.
+  readonly property var headings: Model.headings(root.wikiRows.length, root.jiraRows.length,
+                                                 root.freshRows.length, root.language)
   // Nothing left to read, but the day was not empty -- the one state that has
   // somewhere else to point.
   readonly property bool caughtUp: !root.showingAll
@@ -538,20 +548,21 @@ Item {
                   required property int index
                   required property var modelData
 
-                  // index is always a valid row here, so reaching freshFrom
-                  // means there is at least one unsummarised row to head.
-                  readonly property bool startsFresh: index === root.freshFrom
+                  // Null on every row that does not start a section, which is
+                  // most of them.
+                  readonly property var heading: root.headings[index] || null
 
                   width: itemColumn.width
                   spacing: Style.space(8)
 
-                  // Says where the summarised digest stops and the raw tail
-                  // begins, so a row without a summary reads as a boundary
-                  // rather than as a half-loaded card.
+                  // Names each block: where the wiki stops and Jira starts, and
+                  // where the summarised digest stops and the raw tail begins --
+                  // so a row without a summary reads as a boundary rather than
+                  // as a half-loaded card.
                   Item {
                     width: parent.width
-                    height: row.startsFresh ? divider.implicitHeight + Style.space(12) : 0
-                    visible: row.startsFresh
+                    height: row.heading ? divider.implicitHeight + Style.space(12) : 0
+                    visible: row.heading !== null
 
                     Row {
                       id: divider
@@ -559,7 +570,7 @@ Item {
                       spacing: Style.space(8)
 
                       Text {
-                        text: Model.freshHeading(root.language)
+                        text: row.heading ? row.heading.title : ""
                         color: root.foreground
                         opacity: 0.55
                         font.family: Style.font.menuFamily
@@ -569,7 +580,8 @@ Item {
                       }
 
                       Text {
-                        text: "· " + Model.freshNote(root.language)
+                        text: "· " + (row.heading ? row.heading.note : "")
+                        visible: row.heading && row.heading.note !== ""
                         color: root.foreground
                         opacity: 0.35
                         font.family: Style.font.menuFamily

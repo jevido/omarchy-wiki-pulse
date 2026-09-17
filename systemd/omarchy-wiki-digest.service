@@ -15,9 +15,11 @@ Environment=OMARCHY_PATH=/usr/share/omarchy
 # Must be the plain `KEY=value` form -- systemd's parser has no `export`.
 EnvironmentFile=-%h/.config/claude-oauth-token.env
 ExecStart=%h/.local/bin/omarchy-wiki-digest run
-# The LLM call is capped at 300s; this leaves room for fetch retries on a slow
-# network without ever hanging the boot path.
-TimeoutStartSec=900
+# Has to outlast two LLM attempts plus the 30s between them, with room for
+# fetch retries on a slow network. At the shipped llmTimeoutSec=300 that is
+# 630s; the headroom here is what lets you raise llmTimeoutSec for the catch-up
+# window after a week away, when the digest is at its longest.
+TimeoutStartSec=1800
 Nice=10
 IOSchedulingClass=idle
 # Restart= is illegal with Type=oneshot, so retries live inside the script and

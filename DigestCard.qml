@@ -152,10 +152,13 @@ Item {
       elide: Text.ElideRight
       font.family: Style.font.menuFamily
       font.pixelSize: Style.font.caption
+      // `status` only ever has a value on a ticket, so the meta line tells the
+      // two sources apart without a badge that would have to be styled.
       text: [
         (card.entry.collection && card.entry.collection.name) || "",
+        card.entry.status || "",
         (card.entry.author && card.entry.author.name) || "",
-        Model.changeLabel(card.entry.changeKind, card.language),
+        Model.changeLabel(card.entry.changeKind, card.language, card.entry.source),
         Model.relativeTime(card.entry.updatedAt, card.language)
       ].filter(function (part) { return part !== "" }).join("  ·  ")
     }

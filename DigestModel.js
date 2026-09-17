@@ -107,6 +107,37 @@ function freshHeading(language) {
   return language === "nl" ? "Sinds vanochtend" : "Since this morning"
 }
 
+// Which pipeline a row came from. Rows written before Jira existed have no
+// source and are wiki rows, which is what they were.
+function sourceOf(item) {
+  return (item && item.source) || "wiki"
+}
+
+function bySource(items, source) {
+  return (items || []).filter(function (item) { return sourceOf(item) === source })
+}
+
+// The section headings, keyed by the row index they sit above.
+//
+// The two sources only get named when both are on screen: a heading that never
+// has a sibling is decoration, and this surface has no room for decoration. The
+// "since this morning" divider is a time boundary, not a source one, so it is
+// always drawn when there is a tail to head.
+function headings(wikiCount, jiraCount, freshCount, language) {
+  var map = {}
+  if (wikiCount > 0 && jiraCount > 0) {
+    map[0] = { title: "Wiki", note: "" }
+    map[wikiCount] = { title: "Jira", note: "" }
+  }
+  if (freshCount > 0) {
+    map[wikiCount + jiraCount] = {
+      title: freshHeading(language),
+      note: freshNote(language)
+    }
+  }
+  return map
+}
+
 // The two things the overlay can be showing. Unread is the door you come in
 // through; everything is the briefing itself, re-readable all day.
 function modeLabel(showingAll, language) {
@@ -167,8 +198,13 @@ function actionLabel(action, language) {
   }
 }
 
-function changeLabel(kind, language) {
-  if (language === "nl") return kind === "new" ? "nieuw" : "gewijzigd"
+function changeLabel(kind, language, source) {
+  var nl = language === "nl"
+  if ((source || "wiki") === "jira") {
+    if (nl) return kind === "new" ? "nieuw ticket" : "ticket bijgewerkt"
+    return kind === "new" ? "new ticket" : "ticket updated"
+  }
+  if (nl) return kind === "new" ? "nieuw" : "gewijzigd"
   return kind === "new" ? "new" : "updated"
 }
 
@@ -199,7 +235,7 @@ function headlineFor(digest, language, count) {
   var n = count || 0
   if (n === 0) {
     if (digest.status === "nodigest") return nl ? "Nog geen overzicht" : "No digest yet"
-    if (digest.status === "empty") return nl ? "Rustig op de wiki" : "Quiet on the wiki"
+    if (digest.status === "empty") return nl ? "Rustig vandaag" : "A quiet day"
     return nl ? "Alles gelezen" : "All caught up"
   }
   if (nl) return n === 1 ? "wijziging" : "wijzigingen"
@@ -211,10 +247,12 @@ function subtitleFor(digest, language) {
   var stats = digest.stats || {}
   if (digest.status === "empty") {
     return nl ? "Niemand heeft iets aangepast sinds je vorige overzicht."
-              : "Nobody touched the wiki since your last digest."
+              : "Nobody touched anything since your last digest."
   }
   var bits = []
   if (stats.authors) bits.push(stats.authors + (nl ? " collega's" : " colleagues"))
+  if (stats.documentsSummarized) bits.push(stats.documentsSummarized + (nl ? " pagina's" : " pages"))
+  if (stats.issuesSummarized) bits.push(stats.issuesSummarized + (nl ? " tickets" : " tickets"))
   if (stats.collections) bits.push(stats.collections + (nl ? " collecties" : " collections"))
   if (stats.daysCovered > 1) bits.push(stats.daysCovered + (nl ? " dagen" : " days"))
   return bits.join(" · ")
@@ -236,6 +274,14 @@ function degradedNotice(digest, language) {
     case "auth_failed":
       return nl ? "Aanmelden bij de wiki is geweigerd — controleer je API-token."
                 : "The wiki rejected our credentials — check the API token."
+    // Jira failing costs you the tickets, not the morning: the wiki half below
+    // is complete, so this says what is missing rather than crying failure.
+    case "jira_unreachable":
+      return nl ? "Jira was niet bereikbaar; deze briefing gaat alleen over de wiki."
+                : "Jira was unreachable; this briefing covers the wiki only."
+    case "jira_auth_failed":
+      return nl ? "Jira weigerde je inloggegevens — controleer het API-token."
+                : "Jira rejected our credentials — check the API token."
     default:
       return ""
   }

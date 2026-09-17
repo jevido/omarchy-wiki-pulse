@@ -68,7 +68,8 @@ systemctl --user list-timers --no-pager 'omarchy-wiki-*' | sed '1d;/^$/,$d' || t
 cat <<'NEXT'
 
 Next:
-  1. Edit ~/.config/omarchy/wiki-digest.json  (baseUrl, tokenCommand, persona, language)
+  1. Edit ~/.config/omarchy/wiki-digest.json  (baseUrl, tokenCommand, persona,
+     language, and the optional jira block -- delete it to run wiki-only)
   2. omarchy-wiki-digest run --window P7D --dry-run   # proves auth, no LLM call
   3. omarchy plugin enable jevido.wiki                # puts the widget on the bar
 NEXT

@@ -5,5 +5,14 @@
   "persona": "software engineer",
   "maxItems": 40,
   "includeOwnEdits": false,
-  "bootstrapDays": 7
+  "bootstrapDays": 7,
+  "jira": {
+    "baseUrl": "https://example.atlassian.net",
+    "email": "you@example.com",
+    "tokenCommand": "echo $JIRA_API_TOKEN",
+    "jql": "",
+    "maxItems": 25,
+    "includeOwnChanges": false,
+    "bootstrapDays": 7
+  }
 }
