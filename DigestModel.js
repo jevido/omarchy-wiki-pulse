@@ -120,6 +120,46 @@ function bySource(items, source) {
 // The word on the card's chip. Deliberately the product name rather than
 // something descriptive: "JIRA" is what you would say out loud, and the chip
 // has to be readable at a glance from across the row.
+// The three source views, in the order `s` walks them. "both" first because
+// it is the one that hides nothing.
+var SOURCE_VIEWS = ["both", "jira", "wiki"]
+
+// The summon payload, which is a JSON string by the time it reaches the
+// overlay and may be anything at all -- "{}", empty, or malformed.
+function openSource(payloadJson) {
+  if (!payloadJson) return "both"
+  try {
+    var parsed = JSON.parse(payloadJson)
+    return (parsed && parsed.source) || "both"
+  } catch (e) {
+    return "both"
+  }
+}
+
+function normalisedSourceView(value) {
+  return SOURCE_VIEWS.indexOf(String(value)) === -1 ? "both" : String(value)
+}
+
+function nextSourceView(current) {
+  var at = SOURCE_VIEWS.indexOf(normalisedSourceView(current))
+  return SOURCE_VIEWS[(at + 1) % SOURCE_VIEWS.length]
+}
+
+function sourceViewLabel(view, language) {
+  var nl = language === "nl"
+  switch (normalisedSourceView(view)) {
+    case "jira": return nl ? "alleen Jira" : "Jira only"
+    case "wiki": return nl ? "alleen wiki" : "wiki only"
+    default:     return nl ? "wiki en Jira" : "wiki and Jira"
+  }
+}
+
+// Names what `s` will switch to, the way modeHint names what `d` will switch
+// to -- which of the three you are in now is said by the section headings.
+function sourceHint(view, language) {
+  return "s " + sourceViewLabel(nextSourceView(view), language)
+}
+
 function sourceLabel(source) {
   return sourceOf({ source: source }) === "jira" ? "JIRA" : "WIKI"
 }
@@ -131,11 +171,13 @@ function sourceLabel(source) {
 // there is only one. A wiki-only day needs no heading: that is what this
 // surface has always been. The "since this morning" divider is a time
 // boundary, not a source one, so it is drawn whenever there is a tail to head.
-function headings(wikiCount, jiraCount, freshCount, language) {
+function headings(wikiCount, jiraCount, freshCount, language, forceLabels) {
   var map = {}
-  if (jiraCount > 0) {
+  // With a filter on, the heading is the only thing on screen saying so, so
+  // it is drawn even for the one source that would otherwise go unlabelled.
+  if (jiraCount > 0 || forceLabels) {
     if (wikiCount > 0) map[0] = { title: "Wiki", note: "" }
-    map[wikiCount] = { title: "Jira", note: "" }
+    if (jiraCount > 0) map[wikiCount] = { title: "Jira", note: "" }
   }
   if (freshCount > 0) {
     map[wikiCount + jiraCount] = {
@@ -165,6 +207,25 @@ function modeHint(showingAll, language) {
   var nl = language === "nl"
   if (showingAll) return nl ? "d ongelezen" : "d unread"
   return nl ? "d alles" : "d everything"
+}
+
+// A filtered view with nothing in it is not the same as a quiet day, and the
+// illustration alone cannot tell them apart. Naming the source turns "nothing
+// here" into "nothing here from this one", which is a different sentence.
+function emptyHeadline(view, language) {
+  var nl = language === "nl"
+  switch (normalisedSourceView(view)) {
+    case "jira": return nl ? "Niets uit Jira" : "Nothing from Jira"
+    case "wiki": return nl ? "Niets van de wiki" : "Nothing from the wiki"
+    default:     return nl ? "Je bent bij." : "You're all caught up."
+  }
+}
+
+// Where to go from an empty filter, since the answer is never "wait".
+function filteredHint(view, language) {
+  var nl = language === "nl"
+  if (normalisedSourceView(view) === "both") return ""
+  return nl ? "s toont beide bronnen" : "s shows both sources"
 }
 
 // Points at the other view rather than just stating the obvious: an inbox that
@@ -245,16 +306,41 @@ function relativeTime(iso, language) {
 // repeat it -- "7  7 wijzigingen" reads as a bug. `count` is what is actually
 // on screen, which depends on the view: the status words describe the day, and
 // a day with seven changes you have already read is not a quiet one.
-function headlineFor(digest, language, count) {
+function headlineFor(digest, language, count, view, hasJira) {
   var nl = language === "nl"
   var n = count || 0
   if (n === 0) {
     if (digest.status === "nodigest") return nl ? "Nog geen overzicht" : "No digest yet"
     if (digest.status === "empty") return nl ? "Rustig vandaag" : "A quiet day"
+    if (normalisedSourceView(view) !== "both") return emptyHeadline(view, language)
     return nl ? "Alles gelezen" : "All caught up"
   }
-  if (nl) return n === 1 ? "wijziging" : "wijzigingen"
-  return n === 1 ? "change" : "changes"
+  // The numeral is its own large glyph beside this, so the word must not
+  // repeat it -- and it names the filter, because a count of sixty means one
+  // thing across both sources and another from Jira alone.
+  var one = n === 1
+  switch (normalisedSourceView(view)) {
+    case "jira": return nl ? (one ? "Jira-wijziging" : "Jira-wijzigingen")
+                           : (one ? "Jira change" : "Jira changes")
+    case "wiki": return nl ? (one ? "wikiwijziging" : "wikiwijzigingen")
+                           : (one ? "wiki change" : "wiki changes")
+  }
+  // Unfiltered has to say so. "60 wijzigingen" reads the same whether or not
+  // half of them are being hidden, and this surface has a filter that can hide
+  // half of them -- so the one state that hides nothing names both sources.
+  // With no tickets anywhere in the digest there is no second source to name,
+  // and spelling out Jira to someone who does not use it is just noise.
+  if (!hasJira) return nl ? (one ? "wijziging" : "wijzigingen")
+                          : (one ? "change" : "changes")
+  return nl ? (one ? "wiki- en Jira-wijziging" : "wiki- en Jira-wijzigingen")
+            : (one ? "wiki and Jira change" : "wiki and Jira changes")
+}
+
+// The other half of "what am I looking at": which of the two reading modes is
+// on. The full view already names the window it covers, so this only has to
+// speak for the unread one.
+function unreadLine(language) {
+  return language === "nl" ? "ongelezen" : "unread"
 }
 
 function subtitleFor(digest, language) {

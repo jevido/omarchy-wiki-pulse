@@ -37,6 +37,20 @@ Item {
   property var pulse: Model.EMPTY_PULSE
   property bool showingAll: false
 
+  // Which sources are on screen: both, jira, wiki. A view rather than a
+  // setting -- the digest still collects everything, this only decides what
+  // you are reading right now. The bar widget hands in the opening value; the
+  // morning summon carries no payload and so always opens on everything.
+  property string sourceView: "both"
+  readonly property bool showWiki: root.sourceView !== "jira"
+  readonly property bool showJira: root.sourceView !== "wiki"
+
+  // Whether Jira is in play at all, read off the unfiltered digest rather than
+  // off the config -- this surface only ever sees the files, and a digest with
+  // no tickets in it has no second source worth naming.
+  readonly property bool hasJira: Model.bySource(root.digest.items, "jira").length > 0
+                                  || Model.bySource(root.pulse.items, "jira").length > 0
+
   // Both halves of the window. The digest is the summarised part; the pulse
   // rows are what landed after it was built, which belongs to the same day
   // even though no model has read them.
@@ -49,14 +63,14 @@ Item {
   // Ranking still happens across both in the model -- the split is about where
   // the eye lands, not about which change matters more.
   readonly property var summarisedAll: root.showingAll ? root.digestItems : root.unreadDigest
-  readonly property var wikiRows: Model.bySource(root.summarisedAll, "wiki")
-  readonly property var jiraRows: Model.bySource(root.summarisedAll, "jira")
+  readonly property var wikiRows: root.showWiki ? Model.bySource(root.summarisedAll, "wiki") : []
+  readonly property var jiraRows: root.showJira ? Model.bySource(root.summarisedAll, "jira") : []
   // The tail keeps the same order, but it stays one section: that divider is a
   // time boundary, and splitting it by source would claim these rows were
   // triaged when nothing has read them.
   readonly property var freshAll: root.showingAll ? root.pulseItems : root.unreadPulse
-  readonly property var freshRows: Model.bySource(root.freshAll, "wiki")
-                                        .concat(Model.bySource(root.freshAll, "jira"))
+  readonly property var freshRows: (root.showWiki ? Model.bySource(root.freshAll, "wiki") : [])
+                             .concat(root.showJira ? Model.bySource(root.freshAll, "jira") : [])
 
   // The list the whole view derives from -- the numeral, the keyboard, the
   // cards and the empty state all read this one property, so they cannot
@@ -64,7 +78,8 @@ Item {
   readonly property var rows: root.wikiRows.concat(root.jiraRows).concat(root.freshRows)
   // Section headings, keyed by the row index they sit above.
   readonly property var headings: Model.headings(root.wikiRows.length, root.jiraRows.length,
-                                                 root.freshRows.length, root.language)
+                                                 root.freshRows.length, root.language,
+                                                 root.sourceView !== "both")
   // Nothing left to read, but the day was not empty -- the one state that has
   // somewhere else to point.
   readonly property bool caughtUp: !root.showingAll
@@ -102,6 +117,11 @@ Item {
     digestFile.reload()
     pulseFile.reload()
     readFile.reload()
+    // The bar widget passes the view it is configured for. Anything else --
+    // the 09:00 summon, a hotkey, an IPC call -- opens on everything, because
+    // a briefing that silently hid half of itself would be worse than one
+    // that shows a section you skip.
+    root.sourceView = Model.normalisedSourceView(Model.openSource(payloadJson))
     // Always opens on the unread view; the full briefing is somewhere you go,
     // not a state you can get stuck in.
     root.showingAll = false
@@ -211,10 +231,28 @@ Item {
 
   function toggleAll() {
     root.showingAll = !root.showingAll
+    root.restageView()
+  }
+
+  function cycleSource() {
+    root.sourceView = Model.nextSourceView(root.sourceView)
+    root.restageView()
+  }
+
+  // What both view switches have to do: the list underneath is a different
+  // list, so the cursor and the stagger start over.
+  //
+  // The numeral does not. Rolling it up from zero is an arrival flourish, and
+  // arrival happens once -- re-running it on every d and s press leaves the
+  // number climbing through values that are not the answer for most of a
+  // second, beside a word that changed instantly. A title that contradicts
+  // itself is worse than one that does not animate. The running animation is
+  // stopped first, or it would keep writing over the value on its way to a
+  // target it was given before the list changed.
+  function restageView() {
     root.selectedIndex = -1
-    root.counter = 0
-    if (root.animate) counterAnim.restart()
-    else root.counter = root.rows.length
+    counterAnim.stop()
+    root.counter = root.rows.length
     root.restage()
   }
 
@@ -361,6 +399,8 @@ Item {
               root.move(-1)
             } else if (event.key === Qt.Key_D) {
               root.toggleAll()
+            } else if (event.key === Qt.Key_S) {
+              root.cycleSource()
             } else if (event.key === Qt.Key_G) {
               root.markItem(root.selectedIndex < 0 ? 0 : root.selectedIndex)
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
@@ -408,18 +448,23 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
 
                   Text {
-                    text: Model.headlineFor(root.digest, root.language, root.rows.length)
+                    text: Model.headlineFor(root.digest, root.language, root.rows.length,
+                                            root.sourceView, root.hasJira)
                     color: root.foreground
                     font.family: Style.font.menuFamily
                     font.pixelSize: Style.font.heading
                     font.bold: true
                   }
 
-                  // Only the full view names its window. The unread list is
-                  // "what is left", which no start date describes.
+                  // The full view names the window it covers; the unread list
+                  // is "what is left", which no start date describes -- so it
+                  // says that instead. Either way the line answers the same
+                  // question the headline half-answers: which of these am I
+                  // reading?
                   Text {
-                    visible: root.showingAll && text !== ""
-                    text: Model.coverageFor(root.digest, root.language)
+                    visible: text !== ""
+                    text: root.showingAll ? Model.coverageFor(root.digest, root.language)
+                                          : Model.unreadLine(root.language)
                     color: root.accent
                     opacity: 0.9
                     font.family: Style.font.menuFamily
@@ -513,7 +558,7 @@ Item {
               }
 
               Text {
-                text: root.language === "nl" ? "Je bent bij." : "You're all caught up."
+                text: Model.emptyHeadline(root.sourceView, root.language)
                 color: root.foreground
                 opacity: 0.75
                 font.family: Style.font.menuFamily
@@ -522,12 +567,16 @@ Item {
                 anchors.horizontalCenter: parent.horizontalCenter
               }
 
-              // An inbox empty because you read it, and one empty because
-              // nothing happened, look identical -- and only the first has
-              // somewhere to send you.
+              // An inbox empty because you read it, one empty because nothing
+              // happened, and one empty because you filtered it all out look
+              // identical -- and the first two are the only ones the
+              // illustration was drawn for. The filter speaks first: it is the
+              // one the reader can undo on the spot.
               Text {
-                visible: root.caughtUp
-                text: Model.caughtUpHint(root.language)
+                visible: root.sourceView !== "both" || root.caughtUp
+                text: root.sourceView !== "both"
+                      ? Model.filteredHint(root.sourceView, root.language)
+                      : Model.caughtUpHint(root.language)
                 color: root.accent
                 opacity: 0.7
                 font.family: Style.font.menuFamily
@@ -702,6 +751,7 @@ Item {
               var nl = root.language === "nl"
               var base = nl ? "↑↓ kiezen · ⏎ openen" : "↑↓ select · ⏎ open"
               return base + " · " + Model.markHint(root.language)
+                          + " · " + Model.sourceHint(root.sourceView, root.language)
                           + " · " + Model.modeHint(root.showingAll, root.language)
             }
             color: root.foreground
@@ -737,5 +787,11 @@ Item {
     // Lets a keybinding drop straight into the full briefing, and makes the
     // toggle testable without synthesising a keypress.
     function everything(): void { root.toggleAll() }
+    // Lets a keybinding drop straight into one source, without walking the
+    // cycle to get there.
+    function source(view: string): void {
+      root.sourceView = Model.normalisedSourceView(view)
+      root.restageView()
+    }
   }
 }
